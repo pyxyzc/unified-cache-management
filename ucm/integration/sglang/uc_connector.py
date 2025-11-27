@@ -1,15 +1,22 @@
 from dataclasses import dataclass, asdict, field
 from enum import Enum
-from typing import Optional
-
+import hashlib
+import pickle
 import torch
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+import torch.distributed as dist
+from typing import TYPE_CHECKING, Any, List, Optional, Union
+from collections import defaultdict
 
+from ucm.integration.sglang.uc_utils import hash_request_tokens, md5
+from ucm.integration.sglang.cuda_block_manager import CUDABlockPool
+from ucm.logger import init_logger
 from ucm.store.factory import UcmConnectorFactory
 from ucm.store.ucmstore import Task
-from dataclasses import dataclass, asdict
-import torch
-from typing import Optional
+
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, KVCache
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -27,7 +34,9 @@ class EnvironmentConfig:
     total_tp_size: int
     is_mla: bool
     layer_num: int
-
+    tp_group: Optional[torch.distributed.ProcessGroup]
+    req_to_token_pool: ReqToTokenPool
+    token_to_kv_pool: KVCache
 
 @dataclass
 class FetchItem:
@@ -52,11 +61,11 @@ class BlockStatus(Enum):
 @dataclass
 class ReqStatus:
     block_hashes: list[str] = field(default_factory=list)
-    block_status_list: list[BlockStatus] = field(default_factory=list)
     fetch_index: int = 0
     dump_index: int = 0
     prefix_begin_index: int = 0
     extend_begin_index: int = 0
+    dump_end_index: int = 0
 
 @dataclass
 class ReqTransferMetadata:
@@ -74,27 +83,267 @@ class UnifiedCacheConnector():
     def __init__(self, uc_connector_name: str, unifiedCacheConfig: UnifiedCacheConfig, environmentConfig: EnvironmentConfig):
         self.environmentConfig = environmentConfig
         self.tp_rank = unifiedCacheConfig.device
+        self.total_tp_size = environmentConfig.total_tp_size
+
         unifiedCacheConfig_dict = asdict(unifiedCacheConfig)
         self.connector = UcmConnectorFactory.create_connector(uc_connector_name, unifiedCacheConfig_dict)
 
-        self.block_size = unifiedCacheConfig.kv_block_size
+        self.is_mla = environmentConfig.is_mla
+        self.cache_nums = 1 if self.is_mla else 2
+
+        self.num_layers = environmentConfig.layer_num
+        self.tp_group = environmentConfig.tp_group
+        
         self.req_status_dict: dict[str, ReqStatus] = {}
-        self.dump_tasks: dict[str, dict[str, list[Task]]] = {}
+        self.dump_tasks: dict[str, dict[str, list[Task]]] 
+        self.block_dump_status: dict[str, dict[str, int]]
+        self.dump_tasks = defaultdict(lambda: defaultdict(list))
+        self.block_dump_status = defaultdict(lambda: defaultdict(int))
 
-    def start_load_kv(self):
-        pass
+        self._transfer_metadata: UCTransferMetadata | None = None
+        self.current_layer: int = 0
+
+        self.block_size = 128 # TODO: make it configurable
+        self.layerwise_load_tasks: dict[str, dict[int, Task]] = {}
+        self.req_to_slots: dict[str, torch.Tensor] = {}
+        self.req_to_token_pool = environmentConfig.req_to_token_pool
+        self.token_to_kv_pool = environmentConfig.token_to_kv_pool
+        if self.is_mla:
+            kv_buffer = self.token_to_kv_pool.kv_buffer  # shape: [num_layers, ...]
+            self.kvcache = [(kv_buffer[i], kv_buffer[i]) for i in range(len(kv_buffer))]
+            self.cuda_block_pool = CUDABlockPool(
+                is_mla=self.is_mla,
+                block_size=self.block_size,
+                kv_cache_dim=self.token_to_kv_pool.kv_cache_dim,
+                dtype=self.token_to_kv_pool.store_dtype,
+            )
+        else:
+            k_buffer = self.token_to_kv_pool.k_buffer   # shape: [num_layers, ...]
+            v_buffer = self.token_to_kv_pool.v_buffer   # shape: [num_layers, ...]
+            self.kvcache = [(k_buffer[i], v_buffer[i]) for i in range(len(k_buffer))]
+            self.cuda_block_pool = CUDABlockPool(
+                is_mla=self.is_mla,
+                block_size=self.block_size,
+                head_num=self.token_to_kv_pool.head_num,
+                head_dim=self.token_to_kv_pool.head_dim,
+                dtype=self.token_to_kv_pool.store_dtype,
+            )
+        self.task_to_cuda_blocks: dict[Task, List[int]] = {}
+
+    def _data_offset_mha(self, kv_layer, layer_id, block_size=128):
+        # Non-MLA scene: one layer shape is  (num_tokens num_kv_heads, head_size)
+        # kvcache = [self.token_to_kv_pool.k_buffer, self.token_to_kv_pool.v_buffer]
+        # Element size
+        elem_size = kv_layer[0].element_size()
+        logger.debug(
+            f"total_tp_size = {self.total_tp_size},\n" f"element size = {elem_size}."
+        )
+        # One block size
+        k_min_data_block_size = (
+            kv_layer[0][0].numel() * block_size
+        ) * elem_size
+        v_min_data_block_size = (
+            kv_layer[1][0].numel() * block_size
+        ) * elem_size
+        # When tp > 1 layer_size = (k_min_data_block_size + v_min_data_block_size) * tp_size
+
+        layer_size = (k_min_data_block_size + v_min_data_block_size) * self.total_tp_size 
+        offset = int(layer_size * layer_id + layer_size / self.total_tp_size * self.tp_rank)
+        # Offset of k = layer_size * layer_id + layer_size / tp_size * current rank
+        # Offset of v = Offset of k + k_min_data_block_size
+        return offset, offset + k_min_data_block_size
+
+    def _data_offset_mla(self, kv_layer, layer_id, block_size=128):
+        # MLA scene: one layer shape is (num_tokens , 1 , head_size)
+        # kvcache = [self.token_to_kv_pool.kv_buffer]
+        # Element size
+        elem_size = kv_layer[0].element_size()
+        logger.debug(
+            f"total_tp_size = {self.total_tp_size},\n" f"element size = {elem_size}."
+        )
+        # One block size
+        kv_min_data_block_size = (
+            kv_layer[0][0].numel() * block_size
+        ) * elem_size
+        # layer_size = k_min_data_block_size
+        layer_size = kv_min_data_block_size
+        offset = int(layer_size * layer_id)
+        # Offset of kv = layer_size * layer_id 
+        return offset
+    
+    def _build_transfer_data_mla(
+        self, kv_layer, layer_id, token_slots: torch.Tensor, block_size=128
+    ) -> tuple[List[torch.Tensor], List[int]]:
+        '''
+        Build transfer data and offsets for MHA (non-MLA) kv cache.
+        '''
+        kv_tensors = []
+        kv_offsets = []
+        kv_cuda_blocks = []
+
+        for blk_id in token_slots.view(-1, block_size):
+            cuda_block_id = self.cuda_block_pool.alloc(kv_layer[0][blk_id])
+            cuda_block = self.cuda_block_pool.get_block(cuda_block_id)
+            offset = self._data_offset_mla(kv_layer, layer_id, block_size)
+            kv_tensors.append(cuda_block)
+            kv_offsets.append(offset)
+            kv_cuda_blocks.append(cuda_block_id)
+        return kv_tensors, kv_offsets, kv_cuda_blocks
+    
+    def _build_transfer_data_mha(
+        self, kv_layer, layer_id, token_slots: torch.Tensor, block_size=128
+    ) -> tuple[List[torch.Tensor], List[int]]:
+        '''
+        Build transfer data and offsets for MLA kv cache.
+        '''
+        k_tensors = []
+        k_offsets = []
+        k_cuda_blocks = []
+        v_tensors = []
+        v_offsets = []
+        v_cuda_blocks = []
+        
+
+        for blk_id in token_slots.view(-1, block_size):
+            cuda_k_block_id = self.cuda_block_pool.alloc(kv_layer[0][blk_id])
+            cuda_k_block = self.cuda_block_pool.get_block(cuda_k_block_id)
+            cuda_v_block_id = self.cuda_block_pool.alloc(kv_layer[1][blk_id])
+            cuda_v_block = self.cuda_block_pool.get_block(cuda_v_block_id)
+            offset_k, offset_v = self._data_offset_mha(kv_layer, layer_id, block_size)
+            k_tensors.append(cuda_k_block)
+            k_offsets.append(offset_k)
+            k_cuda_blocks.append(cuda_k_block_id)
+            v_tensors.append(cuda_v_block)
+            v_offsets.append(offset_v)
+            v_cuda_blocks.append(cuda_v_block_id)
+        return k_tensors + v_tensors, k_offsets + v_offsets, k_cuda_blocks + v_cuda_blocks
+
+    def _free_task_cuda_blocks(self, task: Task):
+        cuda_blocks = self.task_to_cuda_blocks.pop(task, [])
+        for cuda_block_id in cuda_blocks:
+            self.cuda_block_pool.free(cuda_block_id)
+
+    def start_load_kv(self, token_slots: torch.Tensor, request_id: str):
+        req_status = self.req_status_dict.get(request_id, None)
+        if not req_status:
+            return
+
+        for layer_id, kv_layer in enumerate(self.kvcache):
+            if self.is_mla:
+                tensors, offsets, cuda_blocks = self._build_transfer_data_mha(
+                    kv_layer, layer_id, token_slots
+                )
+            else:
+                tensors, offsets, cuda_blocks = self._build_transfer_data_mla(
+                    kv_layer, layer_id, token_slots
+                )
+            task_id = self.connector.load(req_status.block_hashes, offsets, tensors)
+            self.task_to_cuda_blocks[task_id] = cuda_blocks
+            self.layerwise_load_tasks[request_id][layer_id] = task_id
+        self.req_to_slots[request_id] = token_slots
 
 
-    def wait_for_layer_load(self):
-        pass
+    def wait_for_layer_load(self, layer_id: int):
+        # self.layerwise_load_tasks: dict[str, dict[int, Task]] = {}
+        # request_id layer_id task
+        
+        if not self.layerwise_load_tasks:
+            return
 
+        for request_id, layer_task_dict in list(self.layerwise_load_tasks.items()):
+            task = layer_task_dict.pop(layer_id, None)
+            if task is None:
+                continue
+            token_slots = self.req_to_slots[request_id]
+            ret = self.connector.wait(task)
 
-    def save_kv_layer(self):
-        pass
+            cuda_blocks = self.task_to_cuda_blocks.get(task, [])
+            for cuda_block_id, blk_id in zip(cuda_blocks, token_slots.view(-1, self.block_size)):
+                # TODO：transfer cuda block back to kvtotokenpool
+                kv_layer = self.kvcache[layer_id]
+                kv_layer[0][blk_id] = self.cuda_block_pool.get_block(cuda_block_id)
 
+            
+            self._free_task_cuda_blocks(task)
 
-    def wait_for_save(self):
-        pass
+            if ret != 0:
+                logger.error(
+                    f"Wait load task failed for request {request_id}, layer {layer_id}."
+                )
+
+            if not layer_task_dict:
+                self.layerwise_load_tasks.pop(request_id, None)
+
+    def _get_kv_layer(self, layer_id: int):
+        if not (0 <= layer_id < len(self.kvcache)):
+            raise IndexError(f"layer_id {layer_id} out of range (0 ~ {len(self.kvcache)-1})")
+
+        if self.is_mla:
+            kv_layer = self.kvcache[layer_id]
+            return kv_layer
+        else:
+            k_layer, v_layer = self.kvcache[layer_id]
+            return k_layer, v_layer
+
+    def _layer_name_to_id(layer_name: str) -> int:
+        """
+        Extract the layer index from the module name.
+        Examples:
+        - "encoder.layers.0" -> 0
+        - "encoder.layers.1.self_attn" -> 1
+        - "2.self_attn" -> 2
+        - "model.encoder.layers.0.sub.1" -> ValueError
+        """
+        subnames = layer_name.split(".")
+        int_vals: list[int] = []
+        for subname in subnames:
+            try:
+                int_vals.append(int(subname))
+            except ValueError:
+                continue
+        assert len(int_vals) == 1, (
+            f"layer name {layer_name} should" " only contain one integer"
+        )
+        return int_vals[0]
+
+    def get_num_new_matched_tokens(
+        self,
+        request_id: str,
+        token_ids: List[int],
+        num_computed_tokens: int,
+    ) -> int:
+        # Preempted request handling
+        # TODO
+
+        assert num_computed_tokens % self.block_size == 0
+        block_hashes = hash_request_tokens(md5, self.block_size, token_ids)
+        if not block_hashes:
+            return 0
+        start_position = num_computed_tokens // self.block_size
+        block_operations = [BlockStatus.NONE] * len(block_hashes)
+        remain_hashes = block_hashes[start_position:]
+        if not remain_hashes:
+            return 0
+        lookup_results = self.connector.lookup(remain_hashes)
+        num_lookup_hits = 0
+        for i, hit in enumerate(lookup_results):
+            if hit:
+                num_lookup_hits += 1
+                block_operations[start_position + i] = BlockStatus.FETCH
+            else:
+                break
+        if (num_lookup_hits + start_position) * self.block_size == len(
+            token_ids
+        ):
+            num_lookup_hits -= 1
+            block_operations[-1] = BlockStatus.NONE
+
+        self.req_status_dict[request_id] = ReqStatus(
+            block_hashes=block_hashes,
+            fetch_index=start_position,
+            dump_index=start_position + num_lookup_hits,
+        )
+        return num_lookup_hits * self.block_size
 
     def _convert_len(self, len: int):
         assert len >= 0
