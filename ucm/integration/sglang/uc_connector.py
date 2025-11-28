@@ -377,6 +377,208 @@ class UnifiedCacheConnector():
                 for _ in range(self.cache_nums):
                     self.dump_tasks[req_meta.request_id][block_id].append(task)
 
+    def _find_block_index(self, req_status: ReqStatus, block_id: str) -> int:
+        for i, h in enumerate(req_status.block_hashes):
+            if h == block_id:
+                return i
+        return -1
+
+    def _tp_reduce_blocks_all(
+        self,
+        local_success_by_req: dict[str, list[str]],
+        local_fail_by_req: dict[str, list[str]],
+    ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+        if self.tp_group is None:
+            if self.total_tp_size != 1:
+                logger.error(
+                    f"TP size: {self.total_tp_size}, but tp_group has not been initialized."
+                )
+
+            return local_success_by_req, local_fail_by_req
+
+        request_ids = sorted(local_success_by_req.keys())
+
+        success_masks = []
+        fail_masks = []
+        block_nums = []
+
+        for request_id in request_ids:
+            req_status = self.req_status_dict[request_id]
+            block_ids = list(req_status.block_hashes)
+            id2index = {block_id: i for i, block_id in enumerate(block_ids)}
+
+            n = len(block_ids)
+            block_nums.append(n)
+            total_blocks += n
+
+            success_mask = torch.zeros(n, dtype=torch.int32, device="cuda")
+            fail_mask = torch.zeros(n, dtype=torch.int32, device="cuda")
+
+            for block_id in local_success_by_req.get(request_id, []):
+                index = id2index.get(block_id, None)
+                if index is not None:
+                    success_mask[index] = 1
+
+            for block_id in local_fail_by_req.get(request_id, []):
+                index = id2index.get(block_id, None)
+                if index is not None:
+                    fail_mask[index] = 1
+
+            success_masks.append(success_mask)
+            fail_masks.append(fail_mask)
+
+        success_mask_all = torch.cat(success_masks, dim=0)
+        fail_mask_all = torch.cat(fail_masks, dim=0)
+
+        dist.all_reduce(success_mask_all, op=dist.ReduceOp.MIN, group=self.tp_group)
+        dist.all_reduce(fail_mask_all, op=dist.ReduceOp.MAX, group=self.tp_group)
+
+        global_success_by_req: dict[str, list[str]] = {}
+        global_fail_by_req: dict[str, list[str]] = {}
+
+        offset = 0
+        for request_id, n in zip(request_ids, block_nums):
+            req_status = self.req_status_dict[request_id]
+            block_ids = list(req_status.block_hashes)
+
+            success_chunk = success_mask_all[offset: offset + n]
+            fail_chunk = fail_mask_all[offset: offset + n]
+
+            success_ids = []
+            fail_ids = []
+
+            for i, block_id in enumerate(block_ids):
+                if success_chunk[i].item() == 1:
+                    success_ids.append(block_id)
+                if fail_chunk[i].item() == 1:
+                    fail_ids.append(block_id)
+
+            global_success_by_req[request_id] = success_ids
+            global_fail_by_req[request_id] = fail_ids
+
+            offset += n
+
+        return global_success_by_req, global_fail_by_req
+
+    def _update_dump_tasks(
+        self,
+        request_id: str,
+        success_block_ids: list[str], 
+        fail_block_ids: list[str],
+    ):
+        if fail_block_ids:
+            if self.tp_rank == 0:
+                self.connector.commit(fail_block_ids, False)
+            for block_id in fail_block_ids:
+                self.dump_tasks[request_id].pop(block_id, None)
+                self.block_dump_status[request_id].pop(block_id, None)
+
+        if success_block_ids:
+            if self.tp_rank == 0:
+                self.connector.commit(success_block_ids, True)
+            for block_id in success_block_ids:
+                self.dump_tasks[request_id].pop(block_id, None)
+                self.block_dump_status[request_id].pop(block_id, None)
+
+        if request_id in self.dump_tasks and not self.dump_tasks[request_id]:
+            self.dump_tasks.pop(request_id, None)
+            self.block_dump_status.pop(request_id, None)
+
+    def handle_dump_tasks(self):
+        if self.is_mla and self.tp_rank != 0:
+            return
+
+        # Note (pyxyzc): we cannot use _transfer_metadata here, cause the moment 
+        # when the dump task fails and returns is not necessarily the same moment 
+        # when handle_dump_tasks is invoked during the step in which the task was issued.
+
+        request_ids = list(self.dump_tasks.keys())
+        if not request_ids:
+            return
+
+        local_success_by_req: dict[str, list[str]] = {}
+        local_fail_by_req: dict[str, list[str]] = {}
+
+        for request_id in request_ids:
+            block_dump_tasks = self.dump_tasks.get(request_id, {})
+            if not block_dump_tasks:
+                continue
+
+            req_status = self.req_status_dict.get(request_id)
+            if req_status is None:
+                logger.error(
+                    f"Request entered into unifiedcache connector without req status information: {request_id}."
+                )
+                continue
+
+            local_success_block_ids: list[str] = []
+            local_fail_block_ids: list[str] = []
+
+            block_fail_index = -1
+            block_ids = list(block_dump_tasks.keys())
+
+            for block_id in block_ids:
+                tasks = block_dump_tasks.get(block_id, [])
+                block_index = self._find_block_index(req_status, block_id)
+
+                if block_fail_index != -1 and block_index > block_fail_index:
+                    local_fail_block_ids.append(block_id)
+                    continue
+
+                success_flag = True
+
+                for task in tasks:
+                    ret, finished = self.connector.check(task)
+                    if ret != 0:
+                        logger.error(
+                            f"Task {task} failed, check return {ret} for request {request_id}, block {block_id}."
+                        )
+                        success_flag = False
+                        break
+                    elif not finished:
+                        continue
+
+                    wret = self.connector.wait(task)
+                    if wret != 0:
+                        logger.error(
+                            f"Task {task} failed, wait return {wret} for request {request_id}, block {block_id}."
+                        )
+                        success_flag = False
+                        break
+                    else:
+                        self.block_dump_status[request_id][block_id] += 1
+
+                if not success_flag:
+                    local_fail_block_ids.append(block_id)
+
+                    if req_status.dump_end_index == 0:
+                        req_status.dump_end_index = block_index * self.block_size
+                    else:
+                        req_status.dump_end_index = min(
+                            req_status.dump_end_index, block_index * self.block_size
+                        )
+
+                    if block_fail_index == -1:
+                        block_fail_index = block_index
+
+            expected_success_nums = self.cache_nums * self.num_layers
+            for block_id, success_nums in self.block_dump_status[request_id].items():
+                if success_nums >= expected_success_nums:
+                    local_success_block_ids.append(block_id)
+
+            local_success_by_req[request_id] = local_success_block_ids
+            local_fail_by_req[request_id] = local_fail_block_ids
+
+        global_success_by_req, global_fail_by_req = self._tp_reduce_blocks_all(
+            local_success_by_req,
+            local_fail_by_req,
+        )
+
+        for request_id in request_ids:
+            final_success = global_success_by_req.get(request_id, [])
+            final_fail = global_fail_by_req.get(request_id, [])
+            self._update_dump_tasks(request_id, final_success, final_fail)
+
     def _convert_len(self, len: int):
         assert len >= 0
         return (len // self.block_size) * self.block_size
