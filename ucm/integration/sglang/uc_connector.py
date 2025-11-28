@@ -345,6 +345,38 @@ class UnifiedCacheConnector():
         )
         return num_lookup_hits * self.block_size
 
+    def submit_dump_tasks(self, layer_id: int):
+        if self.is_mla and self.tp_rank != 0:
+            return
+
+        uc_transfer_metadata = self._transfer_metadata
+
+        for req_meta in uc_transfer_metadata:
+            dump_items = req_meta.dump_items
+            if len(dump_items) == 0:
+                continue
+
+            block_ids = []
+            cache_out_locs = []
+            for item in dump_items:
+                block_ids.append(item.block_id)
+                cache_out_locs.append(item.cache_out_loc)
+            cahce_out_loc = torch.Tensor(cache_out_locs)
+
+            if not self.is_mla:
+                tensors, offsets, cuda_blocks = self._build_transfer_data_mla(layer_id, cache_out_loc)
+            else:
+                tensors, offsets, cuda_blocks = self._build_transfer_data_mha(layer_id, cache_out_loc)
+
+            torch.cuda.current_stream().synchronize()
+
+            task_id = self.connector.dump(block_ids, tensors, offsets)
+            self.task_to_cuda_blocks[task_id] = cuda_blocks
+
+            for block_id in block_ids:
+                for _ in range(self.cache_nums):
+                    self.dump_tasks[req_meta.request_id][block_id].append(task)
+
     def _convert_len(self, len: int):
         assert len >= 0
         return (len // self.block_size) * self.block_size
