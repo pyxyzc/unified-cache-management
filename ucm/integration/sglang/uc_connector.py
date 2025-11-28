@@ -76,7 +76,7 @@ class ReqTransferMetadata:
 
 @dataclass
 class UCTransferMetadata:
-    requests: list[ReqTransferMetadata] = field(default_factory=list)
+    request_metadata_list: list[ReqTransferMetadata] = field(default_factory=list)
 
 
 class UnifiedCacheConnector():
@@ -341,7 +341,7 @@ class UnifiedCacheConnector():
 
         uc_transfer_metadata = self._transfer_metadata
 
-        for req_meta in uc_transfer_metadata:
+        for req_meta in uc_transfer_metadata.request_metadata_list:
             dump_items = req_meta.dump_items
             if len(dump_items) == 0:
                 continue
@@ -631,7 +631,7 @@ class UnifiedCacheConnector():
                 fetch_items=fetch_items,
                 dump_items=dump_items,
             )
-            meta.requests.append(req_transfer_meta)
+            meta.request_metadata_list.append(req_transfer_meta)
 
             req_status.prefix_begin_index = prefix_end
             req_status.extend_begin_index = extend_end
