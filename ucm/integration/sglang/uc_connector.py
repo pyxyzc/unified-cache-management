@@ -172,7 +172,7 @@ class UnifiedCacheConnector():
         return offset
     
     def _build_transfer_data_mla(
-        self, kv_layer, layer_id, token_slots: torch.Tensor, block_size=128
+        self, layer_id, token_slots: torch.Tensor, block_size=128
     ) -> tuple[List[torch.Tensor], List[int]]:
         '''
         Build transfer data and offsets for MHA (non-MLA) kv cache.
@@ -180,6 +180,7 @@ class UnifiedCacheConnector():
         kv_tensors = []
         kv_offsets = []
         kv_cuda_blocks = []
+        kv_layer = self.kvcache[layer_id]
 
         for blk_id in token_slots.view(-1, block_size):
             cuda_block_id = self.cuda_block_pool.alloc(kv_layer[0][blk_id])
@@ -191,7 +192,7 @@ class UnifiedCacheConnector():
         return kv_tensors, kv_offsets, kv_cuda_blocks
     
     def _build_transfer_data_mha(
-        self, kv_layer, layer_id, token_slots: torch.Tensor, block_size=128
+        self, layer_id, token_slots: torch.Tensor, block_size=128
     ) -> tuple[List[torch.Tensor], List[int]]:
         '''
         Build transfer data and offsets for MLA kv cache.
@@ -202,7 +203,7 @@ class UnifiedCacheConnector():
         v_tensors = []
         v_offsets = []
         v_cuda_blocks = []
-        
+        kv_layer = self.kvcache[layer_id]
 
         for blk_id in token_slots.view(-1, block_size):
             cuda_k_block_id = self.cuda_block_pool.alloc(kv_layer[0][blk_id])
@@ -228,14 +229,14 @@ class UnifiedCacheConnector():
         if not req_status:
             return
 
-        for layer_id, kv_layer in enumerate(self.kvcache):
+        for layer_id in range(len(self.kvcache)):
             if self.is_mla:
                 tensors, offsets, cuda_blocks = self._build_transfer_data_mha(
-                    kv_layer, layer_id, token_slots
+                    layer_id, token_slots
                 )
             else:
                 tensors, offsets, cuda_blocks = self._build_transfer_data_mla(
-                    kv_layer, layer_id, token_slots
+                    layer_id, token_slots
                 )
             task_id = self.connector.load(req_status.block_hashes, offsets, tensors)
             self.task_to_cuda_blocks[task_id] = cuda_blocks
@@ -273,17 +274,6 @@ class UnifiedCacheConnector():
 
             if not layer_task_dict:
                 self.layerwise_load_tasks.pop(request_id, None)
-
-    def _get_kv_layer(self, layer_id: int):
-        if not (0 <= layer_id < len(self.kvcache)):
-            raise IndexError(f"layer_id {layer_id} out of range (0 ~ {len(self.kvcache)-1})")
-
-        if self.is_mla:
-            kv_layer = self.kvcache[layer_id]
-            return kv_layer
-        else:
-            k_layer, v_layer = self.kvcache[layer_id]
-            return k_layer, v_layer
 
     def _layer_name_to_id(layer_name: str) -> int:
         """
@@ -361,7 +351,7 @@ class UnifiedCacheConnector():
             for item in dump_items:
                 block_ids.append(item.block_id)
                 cache_out_locs.append(item.cache_out_loc)
-            cahce_out_loc = torch.Tensor(cache_out_locs)
+            cache_out_loc = torch.Tensor(cache_out_locs)
 
             if not self.is_mla:
                 tensors, offsets, cuda_blocks = self._build_transfer_data_mla(layer_id, cache_out_loc)
@@ -375,7 +365,7 @@ class UnifiedCacheConnector():
 
             for block_id in block_ids:
                 for _ in range(self.cache_nums):
-                    self.dump_tasks[req_meta.request_id][block_id].append(task)
+                    self.dump_tasks[req_meta.request_id][block_id].append(task_id)
 
     def _find_block_index(self, req_status: ReqStatus, block_id: str) -> int:
         for i, h in enumerate(req_status.block_hashes):
