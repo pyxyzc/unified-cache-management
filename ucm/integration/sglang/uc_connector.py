@@ -332,8 +332,8 @@ class UnifiedCacheConnector():
 
         self.req_status_dict[request_id] = ReqStatus(
             block_hashes=block_hashes,
-            fetch_index=start_position,
-            dump_index=start_position + num_lookup_hits,
+            fetch_index=start_position * self.block_size,
+            dump_index=(start_position + num_lookup_hits) * self.block_size,
         )
         self.update_state_after_alloc(request_id)
 
