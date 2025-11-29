@@ -174,7 +174,7 @@ class UnifiedCacheConnector():
     
     def _build_transfer_data_mla(
         self, layer_id, token_slots: torch.Tensor, block_size=128
-    ) -> tuple[List[torch.Tensor], List[int], List[int]]:
+    ) -> tuple[List[torch.Tensor], List[int]]:
         '''
         Build transfer data and offsets for MHA (non-MLA) kv cache.
         '''
@@ -194,7 +194,7 @@ class UnifiedCacheConnector():
     
     def _build_transfer_data_mha(
         self, layer_id, token_slots: torch.Tensor, block_size=128
-    ) -> tuple[List[torch.Tensor], List[int], List[int]]:
+    ) -> tuple[List[torch.Tensor], List[int]]:
         '''
         Build transfer data and offsets for MLA kv cache.
         '''
@@ -221,7 +221,7 @@ class UnifiedCacheConnector():
         return k_tensors + v_tensors, k_offsets + v_offsets, k_cuda_blocks + v_cuda_blocks
 
     def _free_task_cuda_blocks(self, task: Task):
-        cuda_blocks = self.task_to_cuda_blocks.pop(task.task_id, [])
+        cuda_blocks = self.task_to_cuda_blocks.pop(task, [])
         for cuda_block_id in cuda_blocks:
             self.cuda_block_pool.free(cuda_block_id)
 
@@ -232,16 +232,16 @@ class UnifiedCacheConnector():
 
         for layer_id in range(len(self.kvcache)):
             if self.is_mla:
-                tensors, offsets, cuda_blocks = self._build_transfer_data_mla(
-                    layer_id, token_slots
-                )
-            else:
                 tensors, offsets, cuda_blocks = self._build_transfer_data_mha(
                     layer_id, token_slots
                 )
-            task = self.connector.load(req_status.block_hashes * (1 if self.is_mla else 2), offsets, tensors)
+            else:
+                tensors, offsets, cuda_blocks = self._build_transfer_data_mla(
+                    layer_id, token_slots
+                )
+            task = self.connector.load(req_status.block_hashes, offsets, tensors)
             self.task_to_cuda_blocks[task.task_id] = cuda_blocks
-            self.layerwise_load_tasks.setdefault(request_id, {})[layer_id] = task
+            self.layerwise_load_tasks[request_id][layer_id] = task
         self.req_to_slots[request_id] = token_slots
 
 
@@ -259,17 +259,11 @@ class UnifiedCacheConnector():
             token_slots = self.req_to_slots[request_id]
             ret = self.connector.wait(task)
 
-            cuda_blocks = self.task_to_cuda_blocks.get(task.task_id, [])
-            kv_layer = self.kvcache[layer_id]
-
-            mid = len(token_slots // self.block_size)
-            first_half = cuda_blocks[:mid]
-            second_half = cuda_blocks[mid:]
-            for first, second, blk_id in zip(first_half, second_half, token_slots.view(-1, self.block_size)):
-                kv_layer[0][blk_id] = self.cuda_block_pool.get_block(first)
-                if not self.is_mla:
-                    kv_layer[1][blk_id] = self.cuda_block_pool.get_block(second)
-
+            cuda_blocks = self.task_to_cuda_blocks.get(task, [])
+            for cuda_block_id, blk_id in zip(cuda_blocks, token_slots.view(-1, self.block_size)):
+                # TODO：transfer cuda block back to kvtotokenpool
+                kv_layer = self.kvcache[layer_id]
+                kv_layer[0][blk_id] = self.cuda_block_pool.get_block(cuda_block_id)
 
             
             self._free_task_cuda_blocks(task)
@@ -329,28 +323,18 @@ class UnifiedCacheConnector():
                 block_operations[start_position + i] = BlockStatus.FETCH
             else:
                 break
+        if (num_lookup_hits + start_position) * self.block_size == len(
+            token_ids
+        ):
+            num_lookup_hits -= 1
+            block_operations[-1] = BlockStatus.NONE
 
         self.req_status_dict[request_id] = ReqStatus(
             block_hashes=block_hashes,
             fetch_index=start_position,
             dump_index=start_position + num_lookup_hits,
         )
-        self.update_state_after_alloc(request_id)
-
         return num_lookup_hits * self.block_size
-
-    def update_state_after_alloc(
-        self, request_id: str, 
-    ):
-        request_block_info = self.req_status_dict.get(request_id, None)
-        if request_block_info:
-            block_hashes = request_block_info.block_hashes
-            start_create_pos = request_block_info.dump_index
-            remaining_hashes = block_hashes[start_create_pos:]
-            if remaining_hashes:
-                create_results = self.connector.create(remaining_hashes)
-                if any(ret != 0 for ret in create_results):
-                    logger.warning(f"\ncreate_results on storage: {create_results}\n")
 
     def submit_dump_tasks(self, layer_id: int):
         if self.is_mla and self.tp_rank != 0:
@@ -358,31 +342,27 @@ class UnifiedCacheConnector():
 
         uc_transfer_metadata = self._transfer_metadata
 
-        for req_meta in uc_transfer_metadata:
+        for req_meta in uc_transfer_metadata.request_metadata_list:
             dump_items = req_meta.dump_items
             if len(dump_items) == 0:
                 continue
 
-            block_ids = []
-            cache_out_locs = []
             for item in dump_items:
-                block_ids.append(item.block_id)
-                cache_out_locs.append(item.cache_out_loc)
-            cache_out_loc = torch.Tensor(cache_out_locs)
+                block_id = item.block_id
+                cache_out_loc = item.cache_out_loc
 
-            if not self.is_mla:
-                tensors, offsets, cuda_blocks = self._build_transfer_data_mla(layer_id, cache_out_loc)
-            else:
-                tensors, offsets, cuda_blocks = self._build_transfer_data_mha(layer_id, cache_out_loc)
+                if not self.is_mla:
+                    tensors, offsets, cuda_blocks = self._build_transfer_data_mla(layer_id, cache_out_loc)
+                else:
+                    tensors, offsets, cuda_blocks = self._build_transfer_data_mha(layer_id, cache_out_loc)
 
-            torch.cuda.current_stream().synchronize()
+                torch.cuda.current_stream().synchronize()
 
-            task_id = self.connector.dump(block_ids, tensors, offsets)
-            self.task_to_cuda_blocks[task_id] = cuda_blocks
+                task = self.connector.dump([block_id], offsets, tensors)
+                self.task_to_cuda_blocks[task.task_id] = cuda_blocks
 
-            for block_id in block_ids:
                 for _ in range(self.cache_nums):
-                    self.dump_tasks[req_meta.request_id][block_id].append(task_id)
+                    self.dump_tasks[req_meta.request_id][block_id].append(task)
 
     def _find_block_index(self, req_status: ReqStatus, block_id: str) -> int:
         for i, h in enumerate(req_status.block_hashes):
@@ -416,7 +396,6 @@ class UnifiedCacheConnector():
 
             n = len(block_ids)
             block_nums.append(n)
-            total_blocks += n
 
             success_mask = torch.zeros(n, dtype=torch.int32, device="cuda")
             fail_mask = torch.zeros(n, dtype=torch.int32, device="cuda")
@@ -590,16 +569,23 @@ class UnifiedCacheConnector():
         assert len >= 0
         return (len // self.block_size) * self.block_size
 
-    def build_connector_metadata(self, schedule_batch: ScheduleBatch) -> UCTransferMetadata:
+    def build_connector_metadata(self, schedule_batch: ScheduleBatch) -> None:
         meta = UCTransferMetadata()
+
+        running_offset = 0
 
         for i, req in enumerate(schedule_batch.reqs):
             req_id = req.rid
-            req_status = self.req_status_dict[req_id]
+            req_status = self.req_status_dict.get(req_id)
+            if req_status == None:
+                continue
+
             assert req_status.fetch_index % self.block_size == 0, \
             f"fetch_index ({req_status.fetch_index}) must be block-aligned ({self.block_size})"
             assert req_status.dump_index % self.block_size == 0, \
             f"dump_index ({req_status.dump_index}) must be block-aligned ({self.block_size})"
+            assert req_status.dump_end_index % self.block_size == 0, \
+            f"dump_index ({req_status.dump_end_index}) must be block-aligned ({self.block_size})"
 
             prefix_len = schedule_batch.prefix_lens[i]
             extend_len = schedule_batch.extend_lens[i]
@@ -629,17 +615,25 @@ class UnifiedCacheConnector():
             assert extend_begin >= req_status.dump_index
             dump_len = self._convert_len(extend_len)
             dump_begin = extend_begin
-            dump_end = extend_begin + dump_len
+            if req_status.dump_end_index != 0:
+                dump_end = min(req_status.dump_end_index, extend_begin + dump_len)
+            else:
+                dump_end = extend_begin + dump_len
 
             if dump_end > dump_begin:
                 first_dump_block = dump_begin // self.block_size
                 last_dump_block_exclusive = dump_end // self.block_size
                 for blk in range(first_dump_block, last_dump_block_exclusive):
+
+                    cache_start = running_offset + (blk * self.block_size - dump_begin)
+                    cache_end = cache_start + self.block_size
+
                     dump_items.append(
                         DumpItem(
                             block_id=req_status.block_hashes[blk],
                             start_token_id=blk * self.block_size,
                             end_token_id=(blk + 1) * self.block_size,
+                            cache_out_loc=schedule_batch.out_cache_loc[cache_start:cache_end],
                         )
                     )
 
@@ -648,9 +642,11 @@ class UnifiedCacheConnector():
                 fetch_items=fetch_items,
                 dump_items=dump_items,
             )
-            meta.requests.append(req_transfer_meta)
+            meta.request_metadata_list.append(req_transfer_meta)
 
             req_status.prefix_begin_index = prefix_end
             req_status.extend_begin_index = extend_end
 
-        return meta
+            running_offset += extend_len
+
+        self._transfer_metadata = meta
