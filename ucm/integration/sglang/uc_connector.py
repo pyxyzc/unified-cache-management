@@ -396,7 +396,6 @@ class UnifiedCacheConnector():
 
             n = len(block_ids)
             block_nums.append(n)
-            total_blocks += n
 
             success_mask = torch.zeros(n, dtype=torch.int32, device="cuda")
             fail_mask = torch.zeros(n, dtype=torch.int32, device="cuda")
@@ -570,7 +569,7 @@ class UnifiedCacheConnector():
         assert len >= 0
         return (len // self.block_size) * self.block_size
 
-    def build_connector_metadata(self, schedule_batch: ScheduleBatch) -> UCTransferMetadata:
+    def build_connector_metadata(self, schedule_batch: ScheduleBatch) -> None:
         meta = UCTransferMetadata()
 
         running_offset = 0
