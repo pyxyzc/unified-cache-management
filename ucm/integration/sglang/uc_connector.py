@@ -97,9 +97,9 @@ class UnifiedCacheConnector():
         
         self.req_status_dict: dict[str, ReqStatus] = {}
         self.dump_tasks: dict[str, dict[str, list[Task]]] 
-        self.block_dump_status: dict[str, dict[str, int]]
+        self.block_dump_status: dict[str, dict[str, list[int]]]
         self.dump_tasks = defaultdict(lambda: defaultdict(list))
-        self.block_dump_status = defaultdict(lambda: defaultdict(int))
+        self.block_dump_status = defaultdict(lambda: defaultdict(list[int]))
 
         self._transfer_metadata: UCTransferMetadata | None = None
         self.current_layer: int = 0
@@ -374,11 +374,10 @@ class UnifiedCacheConnector():
 
                 torch.cuda.current_stream().synchronize()
 
-                task = self.connector.dump([block_id], offsets, tensors)
+                task = self.connector.dump([block_id] * 2, offsets, tensors)
                 self.task_to_cuda_blocks[task.task_id] = cuda_blocks
 
-                for _ in range(self.cache_nums):
-                    self.dump_tasks[req_meta.request_id][block_id].append(task)
+                self.dump_tasks[req_meta.request_id][block_id].append(task)
 
     def _find_block_index(self, req_status: ReqStatus, block_id: str) -> int:
         for i, h in enumerate(req_status.block_hashes):
@@ -530,6 +529,8 @@ class UnifiedCacheConnector():
                 success_flag = True
 
                 for task in tasks:
+                    if task.task_id in self.block_dump_status[request_id][block_id]:
+                        continue
                     ret, finished = self.connector.check(task)
                     if ret != 0:
                         logger.error(
@@ -548,7 +549,7 @@ class UnifiedCacheConnector():
                         success_flag = False
                         break
                     else:
-                        self.block_dump_status[request_id][block_id] += 1
+                        self.block_dump_status[request_id][block_id].append(task.task_id)
 
                 if not success_flag:
                     local_fail_block_ids.append(block_id)
@@ -563,8 +564,9 @@ class UnifiedCacheConnector():
                     if block_fail_index == -1:
                         block_fail_index = block_index
 
-            expected_success_nums = self.cache_nums * self.num_layers
-            for block_id, success_nums in self.block_dump_status[request_id].items():
+            expected_success_nums = self.num_layers
+            for block_id, success_tasks in self.block_dump_status[request_id].items():
+                success_nums = len(success_tasks)
                 if success_nums >= expected_success_nums:
                     local_success_block_ids.append(block_id)
 
