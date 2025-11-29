@@ -630,7 +630,7 @@ class UnifiedCacheConnector():
                         )
                     )
 
-            if extend_begin >= req_status.dump_index:
+            if extend_end < req_status.dump_index:
                 continue
             dump_len = self._convert_len(extend_len)
             dump_begin = extend_begin
