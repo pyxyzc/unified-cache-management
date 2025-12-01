@@ -17,12 +17,12 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 
 class DummyReqToTokenPool:
-    """一个空壳即可，当前测试中不使用它的能力。"""
+    """A dummy shell object; not used in current tests."""
     pass
 
 
 class DummyKVPoolMLA:
-    """用于 is_mla=True 的 KVCache 伪实现（MLA 形状）。"""
+    """A KVCache mock implementation for is_mla=True (MLA format)."""
 
     def __init__(
         self,
@@ -32,15 +32,15 @@ class DummyKVPoolMLA:
         device: str | torch.device = "cuda",
         empty: bool = False
     ):
-        # 存储相关属性（与真实实现保持相似的字段名）
+        # Store attributes with names similar to the real implementation
         self.store_dtype = torch.float16
-        self.kv_cache_dim = dim          # 相当于 kv_lora_rank + qk_rope_head_dim
+        self.kv_cache_dim = dim          # Equivalent to kv_lora_rank + qk_rope_head_dim
         self.layer_num = layer_num
         self.size = num_slots
         self.device = torch.device(device)
 
-        # MLA: 每层一个 tensor，形状 (size, 1, kv_cache_dim)
-        # 对应 MLATokenToKVPool 中的：
+        # MLA: each layer has a tensor of shape (size, 1, kv_cache_dim)
+        # Corresponds to MLATokenToKVPool where:
         #   torch.zeros((size, 1, kv_lora_rank + qk_rope_head_dim), ...)
         if empty:
             self.kv_buffer = [
@@ -63,7 +63,7 @@ class DummyKVPoolMLA:
 
 
 class DummyKVPoolMHA:
-    """用于 is_mla=False 的 KVCache 伪实现（MHA 形状）。"""
+    """A KVCache mock implementation for is_mla=False (MHA format)."""
 
     def __init__(
         self,
@@ -74,16 +74,15 @@ class DummyKVPoolMHA:
         device: str | torch.device = "cuda",
         empty: bool = False
     ):
-        # 存储相关属性
+        # Store attributes
         self.store_dtype = torch.float16
-        self.head_num = head_num         # 注意力头数
-        self.head_dim = dim              # 每个头的维度
+        self.head_num = head_num         # Number of attention heads
+        self.head_dim = dim              # Dimension per head
         self.layer_num = layer_num
         self.size = num_slots
         self.device = torch.device(device)
 
-        # MHA: k_buffer / v_buffer: 每层一个 tensor，
-        # 形状 (size, head_num, head_dim)
+        # MHA: k_buffer / v_buffer, each layer is a tensor of shape (size, head_num, head_dim)
         if empty:
             self.k_buffer = [
                 torch.zeros(
@@ -124,14 +123,15 @@ class TestUnifiedCacheConnector(unittest.TestCase):
     
     def setUp(self):
         """
-        在每次测试前，清空 /sgl-workspace/sglang_data 目录中的内容，但保留目录本体。
+        Before each test, clean all content inside /sgl-workspace/sglang_data
+        while keeping the directory itself.
         """
         self.storage_dir = "/sgl-workspace/sglang_data"
 
-        # 若目录不存在，则创建它
+        # Create directory if not exists
         os.makedirs(self.storage_dir, exist_ok=True)
 
-        # 删除目录中所有文件和子目录，但保留目录本体
+        # Remove all files/subdirectories inside it, keep the directory itself
         for entry in os.listdir(self.storage_dir):
             path = os.path.join(self.storage_dir, entry)
             try:
@@ -142,7 +142,7 @@ class TestUnifiedCacheConnector(unittest.TestCase):
             except Exception as e:
                 print(f"Failed to delete {path}: {e}")
 
-    # --------------------- 公共构造工具 --------------------- #
+    # --------------------- Common constructors --------------------- #
     def _build_uc_config(self, is_mla: bool) -> UnifiedCacheConfig:
         head_dim = 1
         layer_num = 1
@@ -187,12 +187,12 @@ class TestUnifiedCacheConnector(unittest.TestCase):
         return hash_request_tokens(md5, 128, token_ids)
 
     def _build_token_slots(self) -> torch.Tensor:
-        # 10 个 block，每个 block 128 个 slot，共 1280
+        # 10 blocks, each block has 128 slots, total = 1280
         token_slots = torch.arange(10).unsqueeze(1) + torch.arange(0, 1280, 10)
         self.assertEqual(token_slots.shape, (10, 128))
         return token_slots
 
-    # ------------------- build_transfer_data 保留 ------------------- #
+    # ------------------- build_transfer_data tests ------------------- #
     def test_build_transfer_data_mla(self):
         uc_config = self._build_uc_config(is_mla=True)
         env_config = self._build_env_config(is_mla=True, layer_num=1)
@@ -212,12 +212,12 @@ class TestUnifiedCacheConnector(unittest.TestCase):
             block_tensors.append(kv_layer[0][blk_id])
 
         for i in range(len(block_tensors)):
-            # 内容必须相等
+            # The content must match
             assert torch.allclose(
                 block_tensors[i], tensors[i]
             ), f"KV content mismatch at index {i}"
 
-            # 地址必须不同（BlockPool 会复制或重新分配 KV）
+            # Memory addresses must differ (BlockPool copies or reassigns KV)
             assert block_tensors[i].data_ptr() != tensors[i].data_ptr(), (
                 f"KV tensors share memory at index {i}, but they should not"
             )
@@ -245,25 +245,25 @@ class TestUnifiedCacheConnector(unittest.TestCase):
         block_tensors = block_k_tensors + block_v_tensors
 
         for i in range(len(block_tensors)):
-            # 内容必须相等
+            # The content must match
             assert torch.allclose(
                 block_tensors[i], tensors[i]
             ), f"KV content mismatch at index {i}"
 
-            # 地址必须不同（BlockPool 会复制或重新分配 KV）
+            # Memory addresses must differ
             assert block_tensors[i].data_ptr() != tensors[i].data_ptr(), (
                 f"KV tensors share memory at index {i}, but they should not"
             )
 
-    # ------------------- dump + load 合并的公共逻辑 ------------------- #
+    # ------------------- Common logic for dump + load ------------------- #
     def _run_dump_and_load(self, is_mla: bool):
         """
-        通用的 dump + load 测试流程：
-        1. 用非空 KVPool 构造 connector，准备数据并执行 dump。
-        2. 用空 KVPool 构造新的 connector，执行 lookup + load。
-        3. 对加载后的 KV 内容做必要的断言。
+        Common dump + load test workflow:
+        1. Build a connector with a non-empty KVPool, prepare data and run dump.
+        2. Build another connector with an empty KVPool, run lookup + load.
+        3. Assert correctness of loaded KV content.
         """
-        # ====== 1. 准备 dump 侧 connector ====== #
+        # ====== 1. Dump-side connector ====== #
         uc_config = self._build_uc_config(is_mla=is_mla)
         env_config = self._build_env_config(is_mla=is_mla, layer_num=1, empty=False)
         connector_dump = UnifiedCacheConnector("UcmNfsStore", uc_config, env_config)
@@ -272,7 +272,7 @@ class TestUnifiedCacheConnector(unittest.TestCase):
         token_slots = self._build_token_slots()
         layer_id = 0
 
-        # 这里根据 MLA / MHA 走不同的 build_transfer_data
+        # MLA / MHA use different build_transfer_data
         if is_mla:
             tensors, offsets, cuda_blocks = connector_dump._build_transfer_data_mla(
                 layer_id, token_slots
@@ -286,7 +286,7 @@ class TestUnifiedCacheConnector(unittest.TestCase):
         self.assertGreater(len(tensors), 0)
         self.assertEqual(len(cuda_blocks), len(offsets))
 
-        # 构造 token_ids 和 request_id
+        # Build token_ids and request_id
         if is_mla:
             token_ids = list(range(1280))
         else:
@@ -294,7 +294,7 @@ class TestUnifiedCacheConnector(unittest.TestCase):
         self.assertEqual(len(token_ids), 1280)
         request_id = f"test_request_dump_{'mla' if is_mla else 'mha'}"
 
-        # 第一次 lookup：对于 dump 场景我们期望是「没有命中，全部需要 dump」
+        # First lookup: Expect no hits before dumping
         storage_hit_num = connector_dump.get_num_new_matched_tokens(
             request_id, token_ids, 0
         )
@@ -311,10 +311,10 @@ class TestUnifiedCacheConnector(unittest.TestCase):
         block_ids = status.block_hashes
         dump_start = status.dump_index
         block_ids = block_ids[dump_start:]
-        # 10 个 block
+        # Expect 10 blocks
         self.assertEqual(len(block_ids), 10)
 
-        # 真正进行 dump
+        # Actual dump
         dump_block_ids = block_ids * (1 if connector_dump.is_mla else 2)
         task = connector_dump.connector.dump(dump_block_ids, offsets, tensors)
         self.assertIsNotNone(task)
@@ -323,24 +323,23 @@ class TestUnifiedCacheConnector(unittest.TestCase):
         self.assertEqual(ret, 0, "dump task failed, wait() should return 0 on success")
         connector_dump.connector.commit(block_ids, True)
 
-        # ====== 2. 准备 load 侧 connector（空 KVPool） ====== #
+        # ====== 2. Load-side connector (empty KVPool) ====== #
         env_config_load = self._build_env_config(is_mla=is_mla, layer_num=1, empty=True)
         connector_load = UnifiedCacheConnector("UcmNfsStore", uc_config, env_config_load)
         self.assertIsNotNone(connector_load)
 
-        # 第二次 lookup：这次应该能从存储中命中一部分 / 全部 block
+        # Second lookup: should hit something after dump
         request_id_load = f"test_request_load_{'mla' if is_mla else 'mha'}"
         storage_hit_num_2 = connector_load.get_num_new_matched_tokens(
             request_id_load, token_ids, 0
         )
-        # 至少应该有命中（>0），具体数量看实现策略
         self.assertGreater(
             storage_hit_num_2,
             0,
             "lookup for load should hit something after dump",
         )
 
-        # 记录下 load 前 KV 的状态，用于之后对比
+        # Record KV state before load
         if is_mla:
             before_kv = [
                 buf.clone()
@@ -356,14 +355,14 @@ class TestUnifiedCacheConnector(unittest.TestCase):
                 for buf in connector_load.token_to_kv_pool.v_buffer
             ]
 
-        # 调用高层接口进行 KV 加载
+        # Call high-level API to load KV
         connector_load.start_load_kv(token_slots, request_id_load)
         connector_load.wait_for_layer_load(0)
 
-        # ====== 3. 对 load 后 KV 内容做断言 ====== #
+        # ====== 3. Assertions after load ====== #
         if is_mla:
             after_kv = connector_load.token_to_kv_pool.kv_buffer
-            # 至少某一层 KV 不再全部为零（因为我们前面 dump 的是随机数）
+            # Some KV must change because dumped values were random
             for layer_id in range(len(after_kv)):
                 self.assertFalse(
                     torch.allclose(after_kv[layer_id], before_kv[layer_id]),
@@ -382,7 +381,7 @@ class TestUnifiedCacheConnector(unittest.TestCase):
                     f"MHA layer {layer_id} V buffer did not change after load",
                 )
 
-    # ------------------- 两种模型类型的 dump+load 测试入口 ------------------- #
+    # ------------------- Entry tests for MLA / MHA ------------------- #
     def test_dump_and_load_mla(self):
         self._run_dump_and_load(is_mla=True)
 
