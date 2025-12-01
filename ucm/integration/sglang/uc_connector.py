@@ -363,20 +363,24 @@ class UnifiedCacheConnector():
             if len(dump_items) == 0:
                 continue
 
+            block_ids: list[str] = []
+            cache_out_loc_list: list[torch.Tensor] = []
             for item in dump_items:
-                block_id = item.block_id
-                cache_out_loc = item.cache_out_loc
+                block_ids.append(item.block_id)
+                cache_out_loc_list.append(item.cache_out_loc)
+            cache_out_locs = torch.cat(cache_out_loc_list, dim=0)
 
-                if not self.is_mla:
-                    tensors, offsets, cuda_blocks = self._build_transfer_data_mla(layer_id, cache_out_loc)
-                else:
-                    tensors, offsets, cuda_blocks = self._build_transfer_data_mha(layer_id, cache_out_loc)
+            if not self.is_mla:
+                tensors, offsets, cuda_blocks = self._build_transfer_data_mla(layer_id, cache_out_locs)
+            else:
+                tensors, offsets, cuda_blocks = self._build_transfer_data_mha(layer_id, cache_out_locs)
 
-                torch.cuda.current_stream().synchronize()
+            torch.cuda.current_stream().synchronize()
 
-                task = self.connector.dump([block_id] * 2, offsets, tensors)
-                self.task_to_cuda_blocks[task.task_id] = cuda_blocks
+            task = self.connector.dump(block_ids * (1 if self.is_mla else 2), offsets, tensors)
+            self.task_to_cuda_blocks[task.task_id] = cuda_blocks
 
+            for block_id in block_ids:
                 self.dump_tasks[req_meta.request_id][block_id].append(task)
 
     def _find_block_index(self, req_status: ReqStatus, block_id: str) -> int:
