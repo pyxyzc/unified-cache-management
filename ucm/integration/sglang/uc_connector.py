@@ -262,16 +262,23 @@ class UnifiedCacheConnector():
             cuda_blocks = self.task_to_cuda_blocks.get(task.task_id, [])
             kv_layer = self.kvcache[layer_id]
 
-            mid = len(token_slots // self.block_size)
-            first_half = cuda_blocks[:mid]
-            second_half = cuda_blocks[mid:]
-            for first, second, blk_id in zip(first_half, second_half, token_slots.view(-1, self.block_size)):
-                kv_layer[0][blk_id] = self.cuda_block_pool.get_block(first)
-                if not self.is_mla:
-                    kv_layer[1][blk_id] = self.cuda_block_pool.get_block(second)
+            block_ids = token_slots.view(-1, self.block_size) 
+            num_blocks = block_ids.shape[0]
 
+            if self.is_mla:
+                for cb, blk_id in zip(cuda_blocks, block_ids):
+                    block = self.cuda_block_pool.get_block(cb)
+                    kv_layer[0][blk_id] = block  # K
+            else:
+                mid = num_blocks
+                first_half = cuda_blocks[:mid]      # K blocks
+                second_half = cuda_blocks[mid:]     # V blocks
 
-            
+                # assert len(first_half) == len(second_half) == num_blocks
+                for k_cb, v_cb, blk_id in zip(first_half, second_half, block_ids):
+                    kv_layer[0][blk_id] = self.cuda_block_pool.get_block(k_cb)
+                    kv_layer[1][blk_id] = self.cuda_block_pool.get_block(v_cb)
+
             self._free_task_cuda_blocks(task)
 
             if ret != 0:
