@@ -516,6 +516,8 @@ class UnifiedCacheConnector():
                 )
                 continue
 
+            success_tasks: list[int] = []
+
             local_success_block_ids: list[str] = []
             local_fail_block_ids: list[str] = []
 
@@ -533,8 +535,9 @@ class UnifiedCacheConnector():
                 success_flag = True
 
                 for task in tasks:
-                    if task.task_id in self.block_dump_status[request_id][block_id]:
+                    if task.task_id in success_tasks:
                         continue
+
                     ret, finished = self.connector.check(task)
                     if ret != 0:
                         logger.error(
@@ -553,6 +556,9 @@ class UnifiedCacheConnector():
                         success_flag = False
                         break
                     else:
+                        success_tasks.append(task.task_id)
+                        self._free_task_cuda_blocks(task)
+
                         self.block_dump_status[request_id][block_id].append(task.task_id)
 
                 if not success_flag:
