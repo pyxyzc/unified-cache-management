@@ -53,12 +53,6 @@ class DumpItem:
     cache_out_loc: torch.Tensor
 
 
-class BlockStatus(Enum):
-    NONE = "none"
-    FETCH = "fetch"
-    DUMP = "dump"
-
-
 @dataclass
 class ReqStatus:
     block_hashes: list[str] = field(default_factory=list)
@@ -229,6 +223,10 @@ class UnifiedCacheConnector():
         req_status = self.req_status_dict.get(request_id, None)
         if not req_status:
             return
+        block_hashes = req_status.block_hashes
+        fetch_begin = req_status.fetch_index // self.block_size
+        fetch_end = req_status.dump_index // self.block_size
+        fetch_block_hashes = block_hashes[fetch_begin:fetch_end]
 
         for layer_id in range(len(self.kvcache)):
             if self.is_mla:
@@ -239,7 +237,7 @@ class UnifiedCacheConnector():
                 tensors, offsets, cuda_blocks = self._build_transfer_data_mha(
                     layer_id, token_slots
                 )
-            task = self.connector.load(req_status.block_hashes * (1 if self.is_mla else 2), offsets, tensors)
+            task = self.connector.load(fetch_block_hashes * (1 if self.is_mla else 2), offsets, tensors)
             self.task_to_cuda_blocks[task.task_id] = cuda_blocks
             self.layerwise_load_tasks.setdefault(request_id, {})[layer_id] = task
         self.req_to_slots[request_id] = token_slots
@@ -262,15 +260,22 @@ class UnifiedCacheConnector():
             cuda_blocks = self.task_to_cuda_blocks.get(task.task_id, [])
             kv_layer = self.kvcache[layer_id]
 
-            mid = len(token_slots // self.block_size)
-            first_half = cuda_blocks[:mid]
-            second_half = cuda_blocks[mid:]
-            for first, second, blk_id in zip(first_half, second_half, token_slots.view(-1, self.block_size)):
-                kv_layer[0][blk_id] = self.cuda_block_pool.get_block(first)
-                if not self.is_mla:
-                    kv_layer[1][blk_id] = self.cuda_block_pool.get_block(second)
+            block_ids = token_slots.view(-1, self.block_size) 
+            num_blocks = block_ids.shape[0]
 
+            if self.is_mla:
+                for cb, blk_id in zip(cuda_blocks, block_ids):
+                    block = self.cuda_block_pool.get_block(cb)
+                    kv_layer[0][blk_id] = block  # K
+            else:
+                mid = num_blocks
+                first_half = cuda_blocks[:mid]      # K blocks
+                second_half = cuda_blocks[mid:]     # V blocks
 
+                # assert len(first_half) == len(second_half) == num_blocks
+                for k_cb, v_cb, blk_id in zip(first_half, second_half, block_ids):
+                    kv_layer[0][blk_id] = self.cuda_block_pool.get_block(k_cb)
+                    kv_layer[1][blk_id] = self.cuda_block_pool.get_block(v_cb)
             
             self._free_task_cuda_blocks(task)
 
@@ -317,7 +322,6 @@ class UnifiedCacheConnector():
         if not block_hashes:
             return 0
         start_position = num_computed_tokens // self.block_size
-        block_operations = [BlockStatus.NONE] * len(block_hashes)
         remain_hashes = block_hashes[start_position:]
         if not remain_hashes:
             return 0
@@ -326,7 +330,6 @@ class UnifiedCacheConnector():
         for i, hit in enumerate(lookup_results):
             if hit:
                 num_lookup_hits += 1
-                block_operations[start_position + i] = BlockStatus.FETCH
             else:
                 break
 
