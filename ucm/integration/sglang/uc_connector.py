@@ -631,15 +631,15 @@ class UnifiedCacheConnector():
             dump_end = min(req_status.end_index, extend_end)
 
             if dump_end > dump_begin:
-                first_dump_block = dump_begin // self.block_size
-                last_dump_block_exclusive = dump_end // self.block_size
-                for blk in range(first_dump_block, last_dump_block_exclusive):
-                    cache_start = running_offset + (blk * self.block_size - dump_begin)
+                start_block_position = dump_begin // self.block_size
+                block_nums = (dump_end - dump_begin) // self.block_size
+                for blk in range(block_nums):
+                    cache_start = extend_begin + blk * self.block_size - dump_begin
                     cache_end = cache_start + self.block_size
 
                     dump_items.append(
                         DumpItem(
-                            block_id=req_status.block_hashes[blk],
+                            block_id=req_status.block_hashes[start_block_position+blk],
                             start_token_id=blk * self.block_size,
                             end_token_id=(blk + 1) * self.block_size,
                             cache_out_loc=schedule_batch.out_cache_loc[cache_start:cache_end],
