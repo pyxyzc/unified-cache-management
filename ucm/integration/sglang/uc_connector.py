@@ -58,9 +58,7 @@ class ReqStatus:
     block_hashes: list[str] = field(default_factory=list)
     fetch_index: int = 0
     dump_index: int = 0
-    prefix_begin_index: int = 0
-    extend_begin_index: int = 0
-    dump_end_index: int = 0
+    end_index: int = 0
 
 @dataclass
 class ReqTransferMetadata:
@@ -337,6 +335,7 @@ class UnifiedCacheConnector():
             block_hashes=block_hashes,
             fetch_index=start_position * self.block_size,
             dump_index=(start_position + num_lookup_hits) * self.block_size,
+            end_index=len(block_hashes) * self.block_size,
         )
         self.update_state_after_alloc(request_id)
 
@@ -615,48 +614,29 @@ class UnifiedCacheConnector():
             f"fetch_index ({req_status.fetch_index}) must be block-aligned ({self.block_size})"
             assert req_status.dump_index % self.block_size == 0, \
             f"dump_index ({req_status.dump_index}) must be block-aligned ({self.block_size})"
-            assert req_status.dump_end_index % self.block_size == 0, \
-            f"dump_index ({req_status.dump_end_index}) must be block-aligned ({self.block_size})"
+            assert req_status.end_index % self.block_size == 0, \
+            f"dump_index ({req_status.end_index}) must be block-aligned ({self.block_size})"
 
             prefix_len = schedule_batch.prefix_lens[i]
             extend_len = schedule_batch.extend_lens[i]
-            prefix_begin = req_status.prefix_begin_index
+            prefix_begin = 0
             prefix_end   = prefix_begin + prefix_len
-            extend_begin = req_status.extend_begin_index
+            extend_begin = prefix_end
             extend_end   = extend_begin + extend_len
-
-            fetch_items = []
-            dump_items = []
-
-            fetch_begin = max(prefix_begin, req_status.fetch_index)
-            fetch_end = min(prefix_end, req_status.dump_index)
-
-            if fetch_end > fetch_begin:
-                first_fetch_block = fetch_begin // self.block_size
-                last_fetch_block_exclusive = (fetch_end + self.block_size - 1) // self.block_size
-                for blk in range(first_fetch_block, last_fetch_block_exclusive):
-                    fetch_items.append(
-                        FetchItem(
-                            block_id=req_status.block_hashes[blk],
-                            start_token_id=blk * self.block_size,
-                            end_token_id=(blk + 1) * self.block_size,
-                        )
-                    )
 
             if extend_end < req_status.dump_index:
                 continue
-            dump_len = self._convert_len(extend_len)
-            dump_begin = extend_begin
-            if req_status.dump_end_index != 0:
-                dump_end = min(req_status.dump_end_index, extend_begin + dump_len)
-            else:
-                dump_end = extend_begin + dump_len
+            
+            fetch_items: list[FetchItem] = []
+            dump_items: list[DumpItem] = []
+            
+            dump_begin = max(req_status.dump_index, extend_begin)
+            dump_end = min(req_status.end_index, extend_end)
 
             if dump_end > dump_begin:
                 first_dump_block = dump_begin // self.block_size
                 last_dump_block_exclusive = dump_end // self.block_size
                 for blk in range(first_dump_block, last_dump_block_exclusive):
-
                     cache_start = running_offset + (blk * self.block_size - dump_begin)
                     cache_end = cache_start + self.block_size
 
@@ -675,9 +655,6 @@ class UnifiedCacheConnector():
                 dump_items=dump_items,
             )
             meta.request_metadata_list.append(req_transfer_meta)
-
-            req_status.prefix_begin_index = prefix_end
-            req_status.extend_begin_index = extend_end
 
             running_offset += extend_len
 
