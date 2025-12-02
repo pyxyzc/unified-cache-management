@@ -538,6 +538,7 @@ class UnifiedCacheConnector():
 
                 for task in tasks:
                     if task.task_id in success_tasks:
+                        self.block_dump_status[request_id][block_id].append(task.task_id)
                         continue
 
                     ret, finished = self.connector.check(task)
@@ -565,13 +566,7 @@ class UnifiedCacheConnector():
 
                 if not success_flag:
                     local_fail_block_ids.append(block_id)
-
-                    if req_status.dump_end_index == 0:
-                        req_status.dump_end_index = block_index * self.block_size
-                    else:
-                        req_status.dump_end_index = min(
-                            req_status.dump_end_index, block_index * self.block_size
-                        )
+                    req_status.end_index = block_index * self.block_size
 
                     if block_fail_index == -1:
                         block_fail_index = block_index
