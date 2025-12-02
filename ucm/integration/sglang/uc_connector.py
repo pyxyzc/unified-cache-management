@@ -272,10 +272,12 @@ class UnifiedCacheConnector():
                 first_half = cuda_blocks[:mid]      # K blocks
                 second_half = cuda_blocks[mid:]     # V blocks
 
-                # assert len(first_half) == len(second_half) == num_blocks
+                assert len(first_half) == len(second_half) == num_blocks
                 for k_cb, v_cb, blk_id in zip(first_half, second_half, block_ids):
-                    kv_layer[0][blk_id] = self.cuda_block_pool.get_block(k_cb)
-                    kv_layer[1][blk_id] = self.cuda_block_pool.get_block(v_cb)
+                    k_block = self.cuda_block_pool.get_block(k_cb)
+                    kv_layer[0][blk_id] = k_block
+                    v_block = self.cuda_block_pool.get_block(v_cb)
+                    kv_layer[1][blk_id] = v_block
             
             self._free_task_cuda_blocks(task)
 
