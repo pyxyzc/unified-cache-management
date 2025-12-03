@@ -636,7 +636,7 @@ class UnifiedCacheConnector():
                 for i in range(block_nums):
                     blk = first_block + i
 
-                    cache_start = extend_begin + blk * self.block_size - dump_begin
+                    cache_start = running_offset + blk * self.block_size - dump_begin
                     cache_end = cache_start + self.block_size
 
                     dump_items.append(
