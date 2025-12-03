@@ -374,7 +374,7 @@ class UnifiedCacheConnector():
                 cache_out_loc_list.append(item.cache_out_loc)
             cache_out_locs = torch.cat(cache_out_loc_list, dim=0)
 
-            if not self.is_mla:
+            if self.is_mla:
                 tensors, offsets, cuda_blocks = self._build_transfer_data_mla(layer_id, cache_out_locs)
             else:
                 tensors, offsets, cuda_blocks = self._build_transfer_data_mha(layer_id, cache_out_locs)
