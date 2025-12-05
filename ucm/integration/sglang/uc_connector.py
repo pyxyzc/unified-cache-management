@@ -332,29 +332,41 @@ class UnifiedCacheConnector():
                 num_lookup_hits += 1
             else:
                 break
-
+        
+        create_ret = self.update_state_after_alloc(request_id)
+        fetch_index = start_position * self.block_size
+        dump_index = (start_position + num_lookup_hits) * self.block_size
+        end_index = len(block_hashes) * self.block_size
+        if not create_ret:
+            end_index = dump_index
         self.req_status_dict[request_id] = ReqStatus(
             block_hashes=block_hashes,
-            fetch_index=start_position * self.block_size,
-            dump_index=(start_position + num_lookup_hits) * self.block_size,
-            end_index=len(block_hashes) * self.block_size,
+            fetch_index=fetch_index,
+            dump_index=dump_index,
+            end_index=end_index,
         )
-        self.update_state_after_alloc(request_id)
 
         return num_lookup_hits * self.block_size
 
-    def update_state_after_alloc(
-        self, request_id: str, 
-    ):
+    def update_state_after_alloc(self, request_id: str) -> bool:
         request_block_info = self.req_status_dict.get(request_id, None)
-        if request_block_info:
-            block_hashes = request_block_info.block_hashes
-            start_create_pos = request_block_info.dump_index
-            remaining_hashes = block_hashes[start_create_pos:]
-            if remaining_hashes:
-                create_results = self.connector.create(remaining_hashes)
-                if any(ret != 0 for ret in create_results):
-                    logger.warning(f"\ncreate_results on storage: {create_results}\n")
+        if not request_block_info:
+            return False
+
+        block_hashes = request_block_info.block_hashes
+        start_block_idx = request_block_info.dump_index // self.block_size
+        remaining_hashes = block_hashes[start_block_idx:]
+
+        if not remaining_hashes:
+            return True
+
+        create_results = self.connector.create(remaining_hashes)
+
+        if any(ret != 0 for ret in create_results):
+            logger.warning(f"\ncreate_results on storage: {create_results}\n")
+            return False
+
+        return True
 
     def submit_dump_tasks(self, layer_id: int):
         if self.is_mla and self.tp_rank != 0:
