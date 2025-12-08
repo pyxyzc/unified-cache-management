@@ -123,6 +123,11 @@ class UnifiedCacheConnector():
             )
         self.task_to_cuda_blocks: dict[Task, List[int]] = {}
 
+        self.prev_dump_block_ids: dict[str, list[str]] = {}
+        self.prev_dump_tensors: dict[str, list[torch.Tensor]] = {}
+        self.prev_dump_offsets: dict[str, list[int]] = {}
+        self.prev_dump_blocks: dict[str, list[int]] = {}
+
     def _data_offset_mha(self, kv_layer, layer_id, block_size=128):
         # Non-MLA scene: one layer shape is  (num_tokens num_kv_heads, head_size)
         # kvcache = [self.token_to_kv_pool.k_buffer, self.token_to_kv_pool.v_buffer]
@@ -349,7 +354,7 @@ class UnifiedCacheConnector():
         request_block_info = self.req_status_dict.get(request_id, None)
         if request_block_info:
             block_hashes = request_block_info.block_hashes
-            start_create_pos = request_block_info.dump_index
+            start_create_pos = request_block_info.dump_index // self.block_size
             remaining_hashes = block_hashes[start_create_pos:]
             if remaining_hashes:
                 create_results = self.connector.create(remaining_hashes)
@@ -362,7 +367,23 @@ class UnifiedCacheConnector():
 
         uc_transfer_metadata = self._transfer_metadata
 
+        torch.cuda.current_stream().synchronize()
+
         for req_meta in uc_transfer_metadata.request_metadata_list:
+            request_id = req_meta.request_id
+
+            if request_id in self.prev_dump_blocks.keys():
+                last_block_ids = self.prev_dump_block_ids[request_id]
+                last_tensors = self.prev_dump_tensors[request_id]
+                last_offsets = self.prev_dump_offsets[request_id]
+                last_blocks = self.prev_dump_blocks[request_id]
+
+                task = self.connector.dump(last_block_ids * (1 if self.is_mla else 2), last_offsets, last_tensors)
+                self.task_to_cuda_blocks[task.task_id] = last_blocks
+
+                for block_id in last_block_ids:
+                    self.dump_tasks[req_meta.request_id][block_id].append(task)
+
             dump_items = req_meta.dump_items
             if len(dump_items) == 0:
                 continue
@@ -375,17 +396,25 @@ class UnifiedCacheConnector():
             cache_out_locs = torch.cat(cache_out_loc_list, dim=0)
 
             if self.is_mla:
-                tensors, offsets, cuda_blocks = self._build_transfer_data_mla(layer_id, cache_out_locs)
+                tensors, offsets, blocks = self._build_transfer_data_mla(layer_id, cache_out_locs)
             else:
-                tensors, offsets, cuda_blocks = self._build_transfer_data_mha(layer_id, cache_out_locs)
+                tensors, offsets, blocks = self._build_transfer_data_mha(layer_id, cache_out_locs)
+            
+            if layer_id == self.num_layers - 1:
+                print("come to last_layer")
+                
+                torch.cuda.current_stream().synchronize()
 
-            torch.cuda.current_stream().synchronize()
+                task = self.connector.dump(block_ids * (1 if self.is_mla else 2), offsets, tensors)
+                self.task_to_cuda_blocks[task.task_id] = blocks
 
-            task = self.connector.dump(block_ids * (1 if self.is_mla else 2), offsets, tensors)
-            self.task_to_cuda_blocks[task.task_id] = cuda_blocks
+                for block_id in block_ids:
+                    self.dump_tasks[req_meta.request_id][block_id].append(task)
 
-            for block_id in block_ids:
-                self.dump_tasks[req_meta.request_id][block_id].append(task)
+            self.prev_dump_block_ids[request_id] = block_ids
+            self.prev_dump_tensors[request_id] = tensors
+            self.prev_dump_offsets[request_id] = offsets
+            self.prev_dump_blocks[request_id] = blocks
 
     def _find_block_index(self, req_status: ReqStatus, block_id: str) -> int:
         for i, h in enumerate(req_status.block_hashes):
@@ -591,6 +620,12 @@ class UnifiedCacheConnector():
             final_success = global_success_by_req.get(request_id, [])
             final_fail = global_fail_by_req.get(request_id, [])
             self._update_dump_tasks(request_id, final_success, final_fail)
+
+
+        self.prev_dump_block_ids.clear()
+        self.prev_dump_tensors.clear()
+        self.prev_dump_offsets.clear()
+        self.prev_dump_blocks.clear()
 
     def _convert_len(self, len: int):
         assert len >= 0

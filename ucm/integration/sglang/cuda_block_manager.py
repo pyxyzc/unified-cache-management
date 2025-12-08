@@ -26,7 +26,7 @@ class CUDABlockPool:
                  kv_cache_dim: int | None = None,
                  head_num: int | None = None,
                  head_dim: int | None = None,
-                 num_blocks: int = 10000,
+                 num_blocks: int = 100000,
                  dtype: torch.dtype = torch.float32,
                  device: str = "cuda"):
         if not torch.cuda.is_available():
