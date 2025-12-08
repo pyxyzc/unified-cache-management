@@ -170,7 +170,7 @@ class UnifiedCacheConnector():
         return offset
     
     def _build_transfer_data_mla(
-        self, layer_id, token_slots: torch.Tensor, block_size=128
+        self, layer_id, token_slots: torch.Tensor, block_size=128, copy: bool = True
     ) -> tuple[List[torch.Tensor], List[int], List[int]]:
         '''
         Build transfer data and offsets for MHA (non-MLA) kv cache.
@@ -181,7 +181,7 @@ class UnifiedCacheConnector():
         kv_layer = self.kvcache[layer_id]
 
         for blk_id in token_slots.view(-1, block_size):
-            cuda_block_id = self.cuda_block_pool.alloc(kv_layer[0][blk_id])
+            cuda_block_id = self.cuda_block_pool.alloc(kv_layer[0][blk_id], copy=copy)
             cuda_block = self.cuda_block_pool.get_block(cuda_block_id)
             offset = self._data_offset_mla(kv_layer, layer_id, block_size)
             kv_tensors.append(cuda_block)
@@ -190,7 +190,7 @@ class UnifiedCacheConnector():
         return kv_tensors, kv_offsets, kv_cuda_blocks
     
     def _build_transfer_data_mha(
-        self, layer_id, token_slots: torch.Tensor, block_size=128
+        self, layer_id, token_slots: torch.Tensor, block_size=128, copy: bool = True
     ) -> tuple[List[torch.Tensor], List[int], List[int]]:
         '''
         Build transfer data and offsets for MLA kv cache.
@@ -204,9 +204,9 @@ class UnifiedCacheConnector():
         kv_layer = self.kvcache[layer_id]
 
         for blk_id in token_slots.view(-1, block_size):
-            cuda_k_block_id = self.cuda_block_pool.alloc(kv_layer[0][blk_id])
+            cuda_k_block_id = self.cuda_block_pool.alloc(kv_layer[0][blk_id], copy=copy)
             cuda_k_block = self.cuda_block_pool.get_block(cuda_k_block_id)
-            cuda_v_block_id = self.cuda_block_pool.alloc(kv_layer[1][blk_id])
+            cuda_v_block_id = self.cuda_block_pool.alloc(kv_layer[1][blk_id], copy=copy)
             cuda_v_block = self.cuda_block_pool.get_block(cuda_v_block_id)
             offset_k, offset_v = self._data_offset_mha(kv_layer, layer_id, block_size)
             k_tensors.append(cuda_k_block)

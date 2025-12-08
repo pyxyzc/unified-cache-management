@@ -72,7 +72,7 @@ class CUDABlockPool:
     # ---------------------------------------------------------------------- #
     # Block operations
     # ---------------------------------------------------------------------- #
-    def alloc(self, tensor: torch.Tensor) -> int:
+    def alloc(self, tensor: torch.Tensor, copy: bool = True) -> int:
         """
         Allocate a block:
         - Input: a tensor (CPU or CUDA)
@@ -89,56 +89,60 @@ class CUDABlockPool:
         """
         if not self._free_list:
             raise RuntimeError("No free blocks available.")
+        
+        # Get a free block
+        block_id = self._free_list.pop()
+        self._in_use.add(block_id)
+        block_view = self._pool[block_id]  # [block_size, ...]
 
-        # Move tensor to CUDA device and correct dtype
-        t = tensor.to(self.device, dtype=self.dtype)
 
-        # Normalize / check shape
-        if self.is_mla:
-            # Expect [block_size, kv_cache_dim] or [block_size, 1, kv_cache_dim]
-            if t.ndim == 3:
+        if copy and tensor is not None:
+            # Move tensor to CUDA device and correct dtype
+            t = tensor.to(self.device, dtype=self.dtype)
+
+            # Normalize / check shape
+            if self.is_mla:
+                # Expect [block_size, kv_cache_dim] or [block_size, 1, kv_cache_dim]
+                if t.ndim == 3:
+                    if t.size(0) != self.block_size:
+                        raise ValueError(
+                            f"Expected first dim (L) == block_size={self.block_size}, "
+                            f"got L={t.size(0)}"
+                        )
+                    if t.size(1) != 1 or t.size(2) != self.kv_cache_dim:
+                        raise ValueError(
+                            f"Expected shape [block_size, 1, {self.kv_cache_dim}], "
+                            f"got {tuple(t.shape)}"
+                        )
+                else:
+                    raise ValueError(
+                        f"Expected tensor dim 2 or 3 for MLA, got dim={t.ndim}"
+                    )
+            else:
+                # non-MLA: expect [block_size, head_num, head_dim]
+                if t.ndim != 3:
+                    raise ValueError(
+                        f"Expected tensor dim=3 [block_size, head_num, head_dim], "
+                        f"got dim={t.ndim}"
+                    )
                 if t.size(0) != self.block_size:
                     raise ValueError(
                         f"Expected first dim (L) == block_size={self.block_size}, "
                         f"got L={t.size(0)}"
                     )
-                if t.size(1) != 1 or t.size(2) != self.kv_cache_dim:
+                if t.size(1) != self.head_num or t.size(2) != self.head_dim:
                     raise ValueError(
-                        f"Expected shape [block_size, 1, {self.kv_cache_dim}], "
+                        f"Expected shape [block_size, {self.head_num}, {self.head_dim}], "
                         f"got {tuple(t.shape)}"
                     )
-            else:
-                raise ValueError(
-                    f"Expected tensor dim 2 or 3 for MLA, got dim={t.ndim}"
-                )
+
+            # Directly cover the entire block
+            block_view.copy_(t)
         else:
-            # non-MLA: expect [block_size, head_num, head_dim]
-            if t.ndim != 3:
-                raise ValueError(
-                    f"Expected tensor dim=3 [block_size, head_num, head_dim], "
-                    f"got dim={t.ndim}"
-                )
-            if t.size(0) != self.block_size:
-                raise ValueError(
-                    f"Expected first dim (L) == block_size={self.block_size}, "
-                    f"got L={t.size(0)}"
-                )
-            if t.size(1) != self.head_num or t.size(2) != self.head_dim:
-                raise ValueError(
-                    f"Expected shape [block_size, {self.head_num}, {self.head_dim}], "
-                    f"got {tuple(t.shape)}"
-                )
-
-        # Get a free block
-        block_id = self._free_list.pop()
-        self._in_use.add(block_id)
-
-        # Directly overwrite the whole block (no need to zero,完全占满)
-        block_view = self._pool[block_id]  # [block_size, ...]
-        block_view.copy_(t)
+            # copy=False: Nothing is done, and the data is then filled from the CPU/disk by load
+            pass
 
         return block_id
-
     def free(self, block_id: int) -> None:
         """
         Free a block:
