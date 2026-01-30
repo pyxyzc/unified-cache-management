@@ -12,7 +12,7 @@ from numpy.typing import NDArray
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.forward_context import ForwardContext
-from vllm.sequence import SequenceStage
+# from vllm.sequence import SequenceStage
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.request import Request, RequestStatus
 
@@ -810,6 +810,7 @@ class ESA(UcmSparseBase):
             request_id=request.request_id,
             num_tokens=num_slots_sparsed,
             new_computed_blocks=new_computed_block_list,
+            num_encoder_tokens=0,
         )
         manual_preempt = False
         # manual_preempt = (request.num_output_tokens % 10) == 0
