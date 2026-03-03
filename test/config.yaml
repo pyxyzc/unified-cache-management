@@ -18,7 +18,7 @@ database:
 
 models:
   ip_ports: "0.0.0.0:10035"
-  tokenizer_path: "/home/models/Qwen3-32B"
+  tokenizer_path: "/home/models/QwQ-32B"
   served_model_name: "vllm_cpu_offload"
   payload: '{"temperature":0, "max_tokens":1024, "ignore_eos":false}'
   enable_clear_hbm: false
@@ -27,9 +27,9 @@ models:
 # LLM Connection Configuration
 llm_connection:
   model: "Qwen3-32B"
-  server_url: "http://141.111.32.70:8244"
-  tokenizer_path: "/mnt/model/Qwen3-32B"
-  llm_type: "vllm"    # vllm/sglang/mindie
+  server_url: "http://127.0.0.1:30000"
+  tokenizer_path: "/home/models/QwQ-32B"
+  llm_type: "sglang"    # vllm/sglang/mindie
   enable_clear_hbm: true   # HBM clear enable, default true
   stream: true    # stream output, default true
   ignore_eos: true    # Ignore the returned terminator, default true

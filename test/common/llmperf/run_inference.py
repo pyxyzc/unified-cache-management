@@ -1,6 +1,8 @@
 import json
 import os
 import random
+import shutil
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -37,7 +39,59 @@ def run_test_cases(
     env.pop("https_proxy", None)
 
     llm_type = config_utils.get_nested_config("llm_connection.llm_type", "")
-    import time
+    sglang_kvcache_dir = config_utils.get_nested_config(
+        "llm_connection.sglang_kvcache_dir", "/sgl-workspace/kvcache"
+    )
+    sglang_kvcache_timeout_s = config_utils.get_nested_config(
+        "llm_connection.sglang_kvcache_timeout_s", 300
+    )
+    try:
+        sglang_kvcache_timeout_s = int(sglang_kvcache_timeout_s)
+    except (TypeError, ValueError):
+        sglang_kvcache_timeout_s = 120
+
+    def wait_until(check_fn, timeout_s: int, wait_desc: str):
+        start_time = time.time()
+        while not check_fn():
+            if time.time() - start_time > timeout_s:
+                raise TimeoutError(f"Timeout while waiting for {wait_desc}")
+            time.sleep(0.2)
+
+    def reset_sglang_kvcache_dir():
+        cache_path = Path(sglang_kvcache_dir)
+        print(f"[INFO] Resetting sglang kvcache directory: {cache_path}")
+
+        if cache_path.is_symlink() or cache_path.is_file():
+            cache_path.unlink()
+        elif cache_path.exists():
+            shutil.rmtree(cache_path)
+
+        wait_until(
+            lambda: not cache_path.exists(),
+            sglang_kvcache_timeout_s,
+            f"directory removal: {cache_path}",
+        )
+
+        cache_path.mkdir(parents=True, exist_ok=True)
+        wait_until(
+            lambda: cache_path.is_dir(),
+            sglang_kvcache_timeout_s,
+            f"directory creation: {cache_path}",
+        )
+
+        expected_shards = [f"{idx:03x}" for idx in range(0x1000)]
+        print(
+            f"[INFO] Creating sglang kvcache shard directories: {len(expected_shards)}"
+        )
+        for shard in expected_shards:
+            (cache_path / shard).mkdir(parents=False, exist_ok=True)
+
+        wait_until(
+            lambda: all((cache_path / shard).is_dir() for shard in expected_shards),
+            sglang_kvcache_timeout_s,
+            f"sglang shard directory creation under: {cache_path}",
+        )
+        print(f"[INFO] sglang kvcache directory ready: {cache_path}")
 
     def run_request(
         phase: str,
@@ -95,7 +149,9 @@ def run_test_cases(
         )
 
     def run_sglang(args, prefill_input):
-        print("[INFO] sglang mode: prefill_1 -> prefill_2 -> normal")
+        print("[INFO] sglang mode: kvcache_clear -> prefill_1 -> prefill_2 -> normal")
+        reset_sglang_kvcache_dir()
+        time.sleep(1)
 
         reset_prefill_cache(env, server_url, llm_type)
 
@@ -114,8 +170,8 @@ def run_test_cases(
         prefill2_args = dict(args)
         prefill2_args.update(
             {
-                "mean_input": 200,
-                "mean_output": 2,
+                "mean_input": 2000,
+                "mean_output": 1000,
                 "max_completed": 1,
                 "concurrent": 1,
             }
