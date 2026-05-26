@@ -61,6 +61,7 @@ Make your code or documentation changes in the branch, keeping them focused and 
 - Python linting and formatting: [black](https://black.readthedocs.io/en/stable/the_black_code_style) and [isort](https://pycqa.github.io/isort/)
 - Spell checking: [codespell](https://github.com/codespell-project/codespell)
 - C++ formatting: [clang-format](https://clang.llvm.org/docs/ClangFormat.html)
+- Rust formatting: [rustfmt](https://github.com/rust-lang/rustfmt), configured by `rustfmt.toml`
 
 It’s recommended to set up a local development environment and run the linter before submitting a PR to help ensure consistent code style.
 
@@ -81,9 +82,16 @@ cd unified-cache-management
 
 # Install lint requirement and enable pre-commit hook
 pip install -r requirements-lint.txt
+rustup component add rustfmt
 
 # Run lint (You need install pre-commits deps via proxy network at first time)
 bash format.sh
+
+# Run only Rust formatting checks
+bash rust-format.sh --check
+
+# Format Rust code in place
+bash rust-format.sh --fix
 ```
 
 ### Step 5: Open a Pull Request (PR)

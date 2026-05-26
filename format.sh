@@ -20,7 +20,9 @@ check_command pre-commit
 # TODO: cleanup SC exclude
 export SHELLCHECK_OPTS="--exclude=SC2046,SC2006,SC2086"
 if [[ "$1" != 'ci' ]]; then
+    bash "$(dirname "$0")/rust-format.sh" --fix
     pre-commit run --all-files
 else
     pre-commit run --all-files --hook-stage manual
+    bash "$(dirname "$0")/rust-format.sh" --check
 fi
