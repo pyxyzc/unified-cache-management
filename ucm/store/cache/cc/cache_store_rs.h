@@ -67,17 +67,39 @@ struct TransBufferMetaNode {
     }
 };
 
-struct TransBufferStrategyView {
+struct TransBufferConfigView {
+    bool shareBufferEnable;
+    bool bypassHitOnLoad;
+    bool ioDirect;
+    const uint8_t* uniqueIdPtr;
+    size_t uniqueIdLen;
+    int32_t deviceId;
+    size_t nodeSize;
+    size_t totalSize;
+    size_t reservedNumber;
+};
+
+struct TransBufferCallbacks {
     void* ctx;
-    size_t (*bucketOf)(void* ctx, const BlockId* block, size_t shard);
-    void (*bucketLock)(void* ctx, size_t iBucket);
-    bool (*bucketTryLock)(void* ctx, size_t iBucket);
-    void (*bucketUnlock)(void* ctx, size_t iBucket);
-    void (*nodeLock)(void* ctx, size_t iNode);
-    void (*nodeUnlock)(void* ctx, size_t iNode);
-    size_t* (*firstAt)(void* ctx, size_t iBucket);
-    size_t (*fetchNode)(void* ctx, bool allowReserved);
-    TransBufferMetaNode* (*metaAt)(void* ctx, size_t iNode);
+    void (*makeLocalHostBuffer)(void* ctx, int32_t deviceId, size_t size, bool ioDirect,
+                                void** outData, void** outHandle, Status* status);
+    void (*freeLocalHostBuffer)(void* ctx, void* handle);
+    void (*registerSharedHostBuffer)(void* ctx, int32_t deviceId, void* data, size_t size,
+                                     void** outDeviceData, Status* status);
+    void (*unregisterSharedHostBuffer)(void* ctx, void* data);
+    size_t (*pageSize)(void* ctx);
+    size_t (*sharedMutexSize)(void* ctx);
+    size_t (*sharedMutexAlign)(void* ctx);
+    bool (*sharedMutexInit)(void* ctx, void* lock);
+    void (*sharedMutexLock)(void* ctx, void* lock);
+    bool (*sharedMutexTryLock)(void* ctx, void* lock);
+    void (*sharedMutexUnlock)(void* ctx, void* lock);
+    size_t (*sharedSpinSize)(void* ctx);
+    size_t (*sharedSpinAlign)(void* ctx);
+    bool (*sharedSpinInit)(void* ctx, void* lock);
+    void (*sharedSpinLock)(void* ctx, void* lock);
+    bool (*sharedSpinTryLock)(void* ctx, void* lock);
+    void (*sharedSpinUnlock)(void* ctx, void* lock);
 };
 
 struct TransBufferGetResult {
@@ -112,7 +134,7 @@ extern "C" void ucm_cache_store_core_free(Core* core);
 extern "C" bool ucm_cache_store_core_trans_enabled(const Core* core);
 extern "C" size_t ucm_cache_store_next_task_id();
 extern "C" TransBufferCore* ucm_cache_store_trans_buffer_new(
-    const TransBufferStrategyView* strategy, bool bypassHitOnLoad, Status* status);
+    const TransBufferConfigView* config, const TransBufferCallbacks* callbacks, Status* status);
 extern "C" void ucm_cache_store_trans_buffer_free(TransBufferCore* core);
 extern "C" void ucm_cache_store_trans_buffer_get(const TransBufferCore* core,
                                                  const BlockId* block, size_t shard,
@@ -121,6 +143,7 @@ extern "C" void ucm_cache_store_trans_buffer_get(const TransBufferCore* core,
 extern "C" void ucm_cache_store_trans_buffer_exist(const TransBufferCore* core,
                                                    const BlockId* block, size_t shard, bool* out,
                                                    Status* status);
+extern "C" void* ucm_cache_store_trans_buffer_data_at(const TransBufferCore* core, size_t pos);
 extern "C" void ucm_cache_store_trans_buffer_acquire(const TransBufferCore* core, size_t pos);
 extern "C" void ucm_cache_store_trans_buffer_release(const TransBufferCore* core, size_t pos);
 extern "C" bool ucm_cache_store_trans_buffer_ready(const TransBufferCore* core, size_t pos);

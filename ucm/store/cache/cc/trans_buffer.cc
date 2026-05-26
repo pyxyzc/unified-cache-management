@@ -22,504 +22,209 @@
  * SOFTWARE.
  * */
 #include "trans_buffer.h"
-#include <atomic>
-#include <filesystem>
-#include <thread>
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <memory>
+#include <pthread.h>
 #include <unistd.h>
 #include "logger/logger.h"
-#include "posix_shm.h"
 #include "trans/buffer.h"
 #include "trans/device.h"
 
 namespace UC::CacheStore {
 
-static constexpr size_t nHashTableBucket = 16411;
-static constexpr auto invalidIndex = std::numeric_limits<size_t>::max();
-
-static inline size_t Hash(const Detail::BlockId& blockId, size_t shard)
-{
-    static UC::Detail::BlockIdHasher blockIdHasher;
-    static std::hash<size_t> shardHasher;
-    constexpr auto goldenSection = 0x9e3779b97f4a7c15ULL;
-    size_t h1 = blockIdHasher(blockId);
-    size_t h2 = shardHasher(shard);
-    return (h1 ^ (h2 + goldenSection + (h1 << 6) + (h1 >> 2))) % nHashTableBucket;
-}
-
-using BufferMetaNode = Rs::TransBufferMetaNode;
-
 static_assert(sizeof(Detail::BlockId) == sizeof(Rs::BlockId));
 static_assert(alignof(Detail::BlockId) == alignof(Rs::BlockId));
-static_assert(offsetof(BufferMetaNode, block) == 0);
 
-class BufferStrategy {
-protected:
-    struct BaseConfig {
-        int32_t deviceId{-1};
-        size_t nodeSize{0};
-        size_t totalSize{0};
-        size_t reservedNumber{0};
-    };
-    BaseConfig base_;
+namespace {
 
-public:
-    BufferStrategy(int32_t deviceId, size_t nodeSize, size_t totalSize, size_t reservedNumber)
-        : base_({deviceId, nodeSize, totalSize, reservedNumber})
-    {
-    }
-    virtual ~BufferStrategy() = default;
-    virtual Status Setup() = 0;
-    virtual void BucketLock(size_t iBucket) = 0;
-    virtual bool BucketTryLock(size_t iBucket) = 0;
-    virtual void BucketUnlock(size_t iBucket) = 0;
-    virtual void NodeLock(size_t iNode) = 0;
-    virtual void NodeUnlock(size_t iNode) = 0;
-    virtual size_t& FirstAt(size_t iBucket) = 0;
-    virtual size_t FetchNode(bool allowReserved) = 0;
-    virtual void* DataAt(size_t iNode) = 0;
-    virtual BufferMetaNode* MetaAt(size_t iNode) = 0;
+struct HostBufferHandle {
+    std::shared_ptr<void> data;
 };
-
-class LocalBufferStrategy : public BufferStrategy {
-    struct BufferHeader {
-        size_t buckets[nHashTableBucket];
-        size_t freeHead;
-        size_t nodeSize;
-        size_t nNode;
-    };
-    struct LocalMutex {
-        pthread_mutex_t mutex;
-        ~LocalMutex() { pthread_mutex_destroy(&mutex); }
-        void Init()
-        {
-            pthread_mutexattr_t attr;
-            pthread_mutexattr_init(&attr);
-            pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_PRIVATE);
-            pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-            pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
-            pthread_mutex_init(&mutex, &attr);
-            pthread_mutexattr_destroy(&attr);
-        }
-        void Lock() { pthread_mutex_lock(&mutex); }
-        bool TryLock() { return pthread_mutex_trylock(&mutex) == 0; }
-        void Unlock() { pthread_mutex_unlock(&mutex); }
-    };
-    struct LocalLock {
-        pthread_spinlock_t lock;
-        ~LocalLock() { pthread_spin_destroy(&lock); }
-        void Init() { pthread_spin_init(&lock, PTHREAD_PROCESS_PRIVATE); }
-        void Lock() { pthread_spin_lock(&lock); }
-        bool TryLock() { return pthread_spin_trylock(&lock) == 0; }
-        void Unlock() { pthread_spin_unlock(&lock); }
-    };
-
-    bool ioDirect_{false};
-    BufferHeader header_;
-    LocalMutex bucketLocks_[nHashTableBucket];
-    std::unique_ptr<LocalLock[]> nodeLocks_;
-    std::unique_ptr<BufferMetaNode[]> meta_;
-    std::shared_ptr<void> data_;
-
-public:
-    LocalBufferStrategy(int32_t deviceId, size_t nodeSize, size_t totalSize, size_t reservedNumber,
-                        bool ioDirect)
-        : BufferStrategy(deviceId, nodeSize, totalSize, reservedNumber), ioDirect_(ioDirect)
-    {
-    }
-    Status Setup() override
-    {
-        const auto deviceId = base_.deviceId;
-        const auto totalSize = base_.totalSize;
-        const auto nodeSize = base_.nodeSize;
-        auto nNode = totalSize / nodeSize;
-        try {
-            nodeLocks_ = std::make_unique<LocalLock[]>(nNode);
-            meta_ = std::make_unique<BufferMetaNode[]>(nNode);
-            for (size_t i = 0; i < nHashTableBucket; i++) { bucketLocks_[i].Init(); }
-            for (size_t i = 0; i < nNode; i++) { nodeLocks_[i].Init(); }
-        } catch (const std::exception& e) {
-            UC_ERROR("Failed({}) to alloc buffer.", e.what());
-            return Status::Error(e.what());
-        }
-        Trans::Device device;
-        auto s = device.Setup(deviceId);
-        if (s.Failure()) [[unlikely]] {
-            UC_ERROR("Failed({}) to setup device({}).", s, deviceId);
-            return s;
-        }
-        auto buffer = device.MakeBuffer();
-        if (!buffer) [[unlikely]] {
-            UC_ERROR("Failed to make buffer on device({}).", deviceId);
-            return Status::Error();
-        }
-        data_ = ioDirect_ ? buffer->MakeHostBuffer4DirectIo(nodeSize * nNode)
-                          : buffer->MakeHostBuffer(nodeSize * nNode);
-        if (!data_) [[unlikely]] {
-            UC_ERROR("Failed to make pinned({}) for device({}).", nodeSize * nNode, deviceId);
-            return Status::OutOfMemory();
-        }
-        for (size_t i = 0; i < nHashTableBucket; i++) { header_.buckets[i] = invalidIndex; }
-        for (size_t i = 0; i < nNode; i++) { meta_[i].Init(); }
-        header_.freeHead = 0;
-        header_.nodeSize = nodeSize;
-        header_.nNode = nNode;
-        return Status::OK();
-    }
-    void BucketLock(size_t iBucket) override { bucketLocks_[iBucket].Lock(); }
-    bool BucketTryLock(size_t iBucket) override { return bucketLocks_[iBucket].TryLock(); }
-    void BucketUnlock(size_t iBucket) override { bucketLocks_[iBucket].Unlock(); }
-    void NodeLock(size_t iNode) override { nodeLocks_[iNode].Lock(); }
-    void NodeUnlock(size_t iNode) override { nodeLocks_[iNode].Unlock(); }
-    size_t& FirstAt(size_t iBucket) override { return header_.buckets[iBucket]; }
-    size_t FetchNode(bool allowReserved) override
-    {
-        const auto limit = header_.nNode - (allowReserved ? 0 : base_.reservedNumber);
-        if (header_.freeHead >= limit) { header_.freeHead = 0; }
-        return header_.freeHead++;
-    }
-    void* DataAt(size_t iNode) override
-    {
-        return ((std::byte*)data_.get()) + header_.nodeSize * iNode;
-    }
-    BufferMetaNode* MetaAt(size_t iNode) override { return meta_.get() + iNode; }
-};
-
-class SharedBufferStrategy : public BufferStrategy {
-protected:
-    struct ShareMutex {
-        pthread_mutex_t mutex;
-        ~ShareMutex() = delete;
-        void Init()
-        {
-            pthread_mutexattr_t attr;
-            pthread_mutexattr_init(&attr);
-            pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-            pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-            pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
-            pthread_mutex_init(&mutex, &attr);
-            pthread_mutexattr_destroy(&attr);
-        }
-        void Lock() { pthread_mutex_lock(&mutex); }
-        bool TryLock() { return pthread_mutex_trylock(&mutex) == 0; }
-        void Unlock() { pthread_mutex_unlock(&mutex); }
-    };
-    struct ShareLock {
-        pthread_spinlock_t lock;
-        ~ShareLock() = delete;
-        void Init() { pthread_spin_init(&lock, PTHREAD_PROCESS_SHARED); }
-        void Lock() { pthread_spin_lock(&lock); }
-        bool TryLock() { return pthread_spin_trylock(&lock) == 0; }
-        void Unlock() { pthread_spin_unlock(&lock); }
-    };
-    static constexpr size_t sharedBufferMagic = (('S' << 16) | ('b' << 8) | 1);
-    struct BufferHeader {
-        std::atomic<size_t> magic;
-        ShareLock lock;
-        size_t nNode;
-        size_t freeHead;
-        size_t buckets[nHashTableBucket];
-        ShareMutex bucketLocks[nHashTableBucket];
-        ShareLock nodeLocks[0];
-    };
-
-    BufferHeader* header_{nullptr};
-    BufferMetaNode* meta_{nullptr};
-    std::byte* data_{nullptr};
-    std::byte* dataOnDevice_{nullptr};
-    const std::string& uuid_;
-    std::string shmName_;
-    size_t nodeSize_{0};
-    size_t nNode_{0};
-    void* addrress_{nullptr};
-    size_t totalSize_{0};
-
-    size_t MetaOffset() const noexcept { return sizeof(BufferHeader) + sizeof(ShareLock) * nNode_; }
-    size_t DataOffset() const noexcept
-    {
-        static const auto pageSize = sysconf(_SC_PAGESIZE);
-        const auto size = MetaOffset() + sizeof(BufferMetaNode) * nNode_;
-        return (size + pageSize - 1) & ~(pageSize - 1);
-    }
-    size_t DataSize() const noexcept { return nodeSize_ * nNode_; }
-    static const std::string& ShmPrefix() noexcept
-    {
-        static std::string prefix{"uc_shm_cache_"};
-        return prefix;
-    }
-    static void CleanUpShmFileExceptMe(const std::string& me)
-    {
-        namespace fs = std::filesystem;
-        std::string_view prefix = ShmPrefix();
-        fs::path shmDir = "/dev/shm";
-        if (!fs::exists(shmDir)) { return; }
-        const auto now = fs::file_time_type::clock::now();
-        const auto keepThreshold = std::chrono::minutes(10);
-        for (const auto& entry : fs::directory_iterator(shmDir)) {
-            const auto& path = entry.path();
-            const auto& name = path.filename().string();
-            if (!entry.is_regular_file() || name.compare(0, prefix.size(), prefix) != 0 ||
-                name == me) {
-                continue;
-            }
-            try {
-                const auto lwt = fs::last_write_time(path);
-                if (now - lwt <= keepThreshold) { continue; }
-                fs::remove(path);
-            } catch (...) {
-            }
-        }
-    }
-    static Status MmapShmFile(PosixShm& shmFile, const size_t size, void*& addr,
-                              bool needTrunc = true)
-    {
-        auto s = Status::OK();
-        if (needTrunc) {
-            s = shmFile.Truncate(size);
-            if (s.Failure()) [[unlikely]] {
-                UC_ERROR("Failed({}) to trunc file({}) with size({}).", s, shmFile.ShmName(), size);
-                return s;
-            }
-        }
-        s = shmFile.MMap(addr, size, true, true, true);
-        if (s.Failure()) [[unlikely]] {
-            UC_ERROR("Failed({}) to mmap file({}) with size({}).", s, shmFile.ShmName(), size);
-            return s;
-        }
-        return Status::OK();
-    }
-    static Status WaitShmHeaderReady(BufferHeader* header)
-    {
-        constexpr auto retryInterval = std::chrono::milliseconds(100);
-        constexpr auto maxTryTime = 100;
-        auto tryTime = 0;
-        do {
-            if (header->magic == sharedBufferMagic) { break; }
-            if (tryTime > maxTryTime) { return Status::Retry(); }
-            std::this_thread::sleep_for(retryInterval);
-            tryTime++;
-        } while (true);
-        return Status::OK();
-    }
-    Status InitShmBuffer(PosixShm& shmFile)
-    {
-        auto s = MmapShmFile(shmFile, totalSize_, addrress_);
-        if (s.Failure()) [[unlikely]] { return s; }
-        header_ = static_cast<BufferHeader*>(addrress_);
-        meta_ = (BufferMetaNode*)(static_cast<std::byte*>(addrress_) + MetaOffset());
-        header_->lock.Init();
-        header_->nNode = nNode_;
-        header_->freeHead = 0;
-        for (size_t i = 0; i < nHashTableBucket; i++) {
-            header_->buckets[i] = invalidIndex;
-            header_->bucketLocks[i].Init();
-        }
-        for (size_t i = 0; i < nNode_; i++) {
-            header_->nodeLocks[i].Init();
-            meta_[i].Init();
-        }
-        header_->magic = sharedBufferMagic;
-        return Status::OK();
-    }
-    Status LoadShmBuffer(PosixShm& shmFile)
-    {
-        auto s = shmFile.ShmOpen(PosixShm::OpenFlag::READ_WRITE);
-        if (s.Failure()) {
-            UC_ERROR("Failed({}) to open file({}).", s, shmFile.ShmName());
-            return s;
-        }
-        s = MmapShmFile(shmFile, totalSize_, addrress_, false);
-        if (s.Failure()) [[unlikely]] { return s; }
-        header_ = static_cast<BufferHeader*>(addrress_);
-        s = WaitShmHeaderReady(header_);
-        if (s.Failure()) [[unlikely]] {
-            UC_ERROR("Shm file({}) not ready.", shmFile.ShmName());
-            return s;
-        }
-        meta_ = (BufferMetaNode*)(static_cast<std::byte*>(addrress_) + MetaOffset());
-        return Status::OK();
-    }
-    Status RegisterBuffer(int32_t deviceId)
-    {
-        data_ = static_cast<std::byte*>(addrress_) + DataOffset();
-        Trans::Device device;
-        auto s = device.Setup(deviceId);
-        if (s.Failure()) [[unlikely]] {
-            UC_ERROR("Failed({}) to setup device({}).", s, deviceId);
-            return s;
-        }
-        const auto dataSize = DataSize();
-        s = Trans::Buffer::RegisterHostBuffer((void*)data_, dataSize, (void**)&dataOnDevice_);
-        if (s.Failure()) [[unlikely]] {
-            UC_ERROR("Failed({}) to register buffer({}) to device({}).", s, dataSize, deviceId);
-            return s;
-        }
-        return Status::OK();
-    }
-
-public:
-    SharedBufferStrategy(const std::string& uuid, int32_t deviceId, size_t nodeSize,
-                         size_t totalSize, size_t reservedNumber)
-        : BufferStrategy(deviceId, nodeSize, totalSize, reservedNumber), uuid_(uuid)
-    {
-    }
-    ~SharedBufferStrategy() override
-    {
-        if (data_) { Trans::Buffer::UnregisterHostBuffer(data_); }
-        if (addrress_) { PosixShm::MUnmap(addrress_, totalSize_); }
-        PosixShm{shmName_}.ShmUnlink();
-    }
-    Status Setup() override
-    {
-        const auto& uuid = uuid_;
-        const auto deviceId = base_.deviceId;
-        const auto nodeSize = base_.nodeSize;
-        const auto totalSize = base_.totalSize;
-        shmName_ = ShmPrefix() + uuid;
-        nodeSize_ = nodeSize;
-        nNode_ = totalSize / nodeSize;
-        CleanUpShmFileExceptMe(shmName_);
-        PosixShm shmFile{shmName_};
-        const auto dataOffset = DataOffset();
-        totalSize_ = dataOffset + DataSize();
-        const auto flags =
-            PosixShm::OpenFlag::CREATE | PosixShm::OpenFlag::EXCL | PosixShm::OpenFlag::READ_WRITE;
-        auto s = shmFile.ShmOpen(flags);
-        if (s.Success()) {
-            s = InitShmBuffer(shmFile);
-        } else if (s == Status::DuplicateKey()) {
-            s = LoadShmBuffer(shmFile);
-        } else {
-            UC_ERROR("Failed({}) to open file({}) with flags({}).", s, shmName_, flags);
-            return s;
-        }
-        return RegisterBuffer(deviceId);
-    }
-    void BucketLock(size_t iBucket) override { header_->bucketLocks[iBucket].Lock(); }
-    bool BucketTryLock(size_t iBucket) override { return header_->bucketLocks[iBucket].TryLock(); }
-    void BucketUnlock(size_t iBucket) override { header_->bucketLocks[iBucket].Unlock(); }
-    void NodeLock(size_t iNode) override { header_->nodeLocks[iNode].Lock(); }
-    void NodeUnlock(size_t iNode) override { header_->nodeLocks[iNode].Unlock(); }
-    size_t& FirstAt(size_t iBucket) override { return header_->buckets[iBucket]; }
-    size_t FetchNode(bool allowReserved) override
-    {
-        const auto limit = header_->nNode - (allowReserved ? 0 : base_.reservedNumber);
-        header_->lock.Lock();
-        if (header_->freeHead >= limit) { header_->freeHead = 0; }
-        const auto iNode = header_->freeHead++;
-        header_->lock.Unlock();
-        return iNode;
-    }
-    void* DataAt(size_t iNode) override { return data_ + nodeSize_ * iNode; }
-    BufferMetaNode* MetaAt(size_t iNode) override { return meta_ + iNode; }
-};
-
-class SharedBufferWatcherStrategy : public SharedBufferStrategy {
-public:
-    SharedBufferWatcherStrategy(const std::string& uuid) : SharedBufferStrategy(uuid, -1, 0, 0, 0)
-    {
-    }
-    Status Setup() override
-    {
-        shmName_ = ShmPrefix() + uuid_;
-        CleanUpShmFileExceptMe(shmName_);
-        PosixShm shmFile{shmName_};
-        auto s = shmFile.ShmOpen(PosixShm::OpenFlag::READ_WRITE);
-        if (s.Failure()) {
-            UC_ERROR("Failed({}) to open file({}).", s, shmFile.ShmName());
-            return s;
-        }
-        void* addr = nullptr;
-        auto size = sizeof(BufferHeader);
-        s = MmapShmFile(shmFile, size, addr, false);
-        if (s.Failure()) [[unlikely]] { return s; }
-        auto header = static_cast<BufferHeader*>(addr);
-        s = WaitShmHeaderReady(header);
-        if (s.Failure()) [[unlikely]] {
-            UC_ERROR("Shm file({}) not ready.", shmFile.ShmName());
-            return s;
-        }
-        nNode_ = header->nNode;
-        shmFile.MUnmap(addr, size);
-        totalSize_ = DataOffset();
-        s = MmapShmFile(shmFile, totalSize_, addrress_, false);
-        if (s.Failure()) [[unlikely]] { return s; }
-        header_ = static_cast<BufferHeader*>(addrress_);
-        meta_ = (BufferMetaNode*)(static_cast<std::byte*>(addrress_) + MetaOffset());
-        return Status::OK();
-    }
-    void* DataAt(size_t iNode) override { return nullptr; }
-};
-
-static const Detail::BlockId& ToDetailBlockId(const Rs::BlockId* block)
-{
-    return *reinterpret_cast<const Detail::BlockId*>(block);
-}
 
 static const Rs::BlockId* ToRsBlockId(const Detail::BlockId& block)
 {
     return reinterpret_cast<const Rs::BlockId*>(&block);
 }
 
-static size_t StrategyBucketOf(void*, const Rs::BlockId* block, size_t shard)
+static void SetRsStatus(Rs::Status* status, const Status& value)
 {
-    return Hash(ToDetailBlockId(block), shard);
+    if (!status) { return; }
+    status->code = value.Success() ? Rs::STATUS_OK : Rs::STATUS_ERROR;
+    std::memset(status->message, 0, Rs::MESSAGE_CAPACITY);
+    if (value.Success()) { return; }
+    const auto message = value.ToString();
+    const auto size = std::min(message.size(), Rs::MESSAGE_CAPACITY - 1);
+    std::memcpy(status->message, message.data(), size);
 }
 
-static void StrategyBucketLock(void* ctx, size_t iBucket)
+static void MakeLocalHostBuffer(void*, int32_t deviceId, size_t size, bool ioDirect,
+                                void** outData, void** outHandle, Rs::Status* status)
 {
-    static_cast<BufferStrategy*>(ctx)->BucketLock(iBucket);
+    if (!outData || !outHandle) {
+        SetRsStatus(status, Status::InvalidParam("invalid host buffer output"));
+        return;
+    }
+    *outData = nullptr;
+    *outHandle = nullptr;
+    try {
+        Trans::Device device;
+        auto s = device.Setup(deviceId);
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Failed({}) to setup device({}).", s, deviceId);
+            SetRsStatus(status, s);
+            return;
+        }
+        auto buffer = device.MakeBuffer();
+        if (!buffer) [[unlikely]] {
+            UC_ERROR("Failed to make buffer on device({}).", deviceId);
+            SetRsStatus(status, Status::Error("failed to make device buffer"));
+            return;
+        }
+        auto data =
+            ioDirect ? buffer->MakeHostBuffer4DirectIo(size) : buffer->MakeHostBuffer(size);
+        if (!data) [[unlikely]] {
+            UC_ERROR("Failed to make pinned({}) for device({}).", size, deviceId);
+            SetRsStatus(status, Status::OutOfMemory());
+            return;
+        }
+        auto handle = std::make_unique<HostBufferHandle>();
+        handle->data = std::move(data);
+        *outData = handle->data.get();
+        *outHandle = handle.release();
+        SetRsStatus(status, Status::OK());
+    } catch (const std::exception& e) {
+        SetRsStatus(status, Status::Error(e.what()));
+    }
 }
 
-static bool StrategyBucketTryLock(void* ctx, size_t iBucket)
+static void FreeLocalHostBuffer(void*, void* handle)
 {
-    return static_cast<BufferStrategy*>(ctx)->BucketTryLock(iBucket);
+    delete static_cast<HostBufferHandle*>(handle);
 }
 
-static void StrategyBucketUnlock(void* ctx, size_t iBucket)
+static void RegisterSharedHostBuffer(void*, int32_t deviceId, void* data, size_t size,
+                                     void** outDeviceData, Rs::Status* status)
 {
-    static_cast<BufferStrategy*>(ctx)->BucketUnlock(iBucket);
+    if (!data || !outDeviceData) {
+        SetRsStatus(status, Status::InvalidParam("invalid shared host buffer"));
+        return;
+    }
+    *outDeviceData = nullptr;
+    Trans::Device device;
+    auto s = device.Setup(deviceId);
+    if (s.Failure()) [[unlikely]] {
+        UC_ERROR("Failed({}) to setup device({}).", s, deviceId);
+        SetRsStatus(status, s);
+        return;
+    }
+    s = Trans::Buffer::RegisterHostBuffer(data, size, outDeviceData);
+    if (s.Failure()) [[unlikely]] {
+        UC_ERROR("Failed({}) to register buffer({}) to device({}).", s, size, deviceId);
+        SetRsStatus(status, s);
+        return;
+    }
+    SetRsStatus(status, Status::OK());
 }
 
-static void StrategyNodeLock(void* ctx, size_t iNode)
+static void UnregisterSharedHostBuffer(void*, void* data)
 {
-    static_cast<BufferStrategy*>(ctx)->NodeLock(iNode);
+    if (data) { (void)Trans::Buffer::UnregisterHostBuffer(data); }
 }
 
-static void StrategyNodeUnlock(void* ctx, size_t iNode)
+static size_t PageSize(void*)
 {
-    static_cast<BufferStrategy*>(ctx)->NodeUnlock(iNode);
+    const auto pageSize = sysconf(_SC_PAGESIZE);
+    return pageSize > 0 ? static_cast<size_t>(pageSize) : 4096;
 }
 
-static size_t* StrategyFirstAt(void* ctx, size_t iBucket)
+static size_t SharedMutexSize(void*) { return sizeof(pthread_mutex_t); }
+static size_t SharedMutexAlign(void*) { return alignof(pthread_mutex_t); }
+
+static bool SharedMutexInit(void*, void* lock)
 {
-    return &static_cast<BufferStrategy*>(ctx)->FirstAt(iBucket);
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr) != 0) { return false; }
+    bool ok = pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED) == 0 &&
+              pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) == 0 &&
+              pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP) == 0 &&
+              pthread_mutex_init(static_cast<pthread_mutex_t*>(lock), &attr) == 0;
+    pthread_mutexattr_destroy(&attr);
+    return ok;
 }
 
-static size_t StrategyFetchNode(void* ctx, bool allowReserved)
+static void SharedMutexLock(void*, void* lock)
 {
-    return static_cast<BufferStrategy*>(ctx)->FetchNode(allowReserved);
+    auto* mutex = static_cast<pthread_mutex_t*>(lock);
+    const auto rc = pthread_mutex_lock(mutex);
+    if (rc == EOWNERDEAD) { (void)pthread_mutex_consistent(mutex); }
 }
 
-static Rs::TransBufferMetaNode* StrategyMetaAt(void* ctx, size_t iNode)
+static bool SharedMutexTryLock(void*, void* lock)
 {
-    return static_cast<BufferStrategy*>(ctx)->MetaAt(iNode);
+    auto* mutex = static_cast<pthread_mutex_t*>(lock);
+    const auto rc = pthread_mutex_trylock(mutex);
+    if (rc == EOWNERDEAD) {
+        (void)pthread_mutex_consistent(mutex);
+        return true;
+    }
+    return rc == 0;
 }
 
-static Rs::TransBufferStrategyView MakeStrategyView(BufferStrategy* strategy)
+static void SharedMutexUnlock(void*, void* lock)
+{
+    (void)pthread_mutex_unlock(static_cast<pthread_mutex_t*>(lock));
+}
+
+static size_t SharedSpinSize(void*) { return sizeof(pthread_spinlock_t); }
+static size_t SharedSpinAlign(void*) { return alignof(pthread_spinlock_t); }
+
+static bool SharedSpinInit(void*, void* lock)
+{
+    return pthread_spin_init(static_cast<pthread_spinlock_t*>(lock), PTHREAD_PROCESS_SHARED) == 0;
+}
+
+static void SharedSpinLock(void*, void* lock)
+{
+    (void)pthread_spin_lock(static_cast<pthread_spinlock_t*>(lock));
+}
+
+static bool SharedSpinTryLock(void*, void* lock)
+{
+    return pthread_spin_trylock(static_cast<pthread_spinlock_t*>(lock)) == 0;
+}
+
+static void SharedSpinUnlock(void*, void* lock)
+{
+    (void)pthread_spin_unlock(static_cast<pthread_spinlock_t*>(lock));
+}
+
+static Rs::TransBufferCallbacks MakeCallbacks()
 {
     return {
-        strategy,
-        &StrategyBucketOf,
-        &StrategyBucketLock,
-        &StrategyBucketTryLock,
-        &StrategyBucketUnlock,
-        &StrategyNodeLock,
-        &StrategyNodeUnlock,
-        &StrategyFirstAt,
-        &StrategyFetchNode,
-        &StrategyMetaAt,
+        nullptr,
+        &MakeLocalHostBuffer,
+        &FreeLocalHostBuffer,
+        &RegisterSharedHostBuffer,
+        &UnregisterSharedHostBuffer,
+        &PageSize,
+        &SharedMutexSize,
+        &SharedMutexAlign,
+        &SharedMutexInit,
+        &SharedMutexLock,
+        &SharedMutexTryLock,
+        &SharedMutexUnlock,
+        &SharedSpinSize,
+        &SharedSpinAlign,
+        &SharedSpinInit,
+        &SharedSpinLock,
+        &SharedSpinTryLock,
+        &SharedSpinUnlock,
     };
 }
+
+}  // namespace
 
 TransBuffer::~TransBuffer() { ResetCore(); }
 
@@ -534,40 +239,23 @@ void TransBuffer::ResetCore() noexcept
 Status TransBuffer::Setup(const Config& config)
 {
     ResetCore();
-    strategy_.reset();
-    bypassHitOnLoad_ = config.cacheLoadBackendOnly;
-    try {
-        if (!config.shareBufferEnable) {
-            strategy_ = std::make_shared<LocalBufferStrategy>(
-                config.deviceId, config.shardSize, config.bufferCapacity,
-                config.loadExclusiveBufferNumber, config.ioDirect);
-        } else if (config.deviceId >= 0) {
-            strategy_ = std::make_shared<SharedBufferStrategy>(
-                config.uniqueId, config.deviceId, config.shardSize, config.bufferCapacity,
-                config.loadExclusiveBufferNumber);
-        } else {
-            strategy_ = std::make_shared<SharedBufferWatcherStrategy>(config.uniqueId);
-        }
-    } catch (const std::exception& e) {
-        return Status::Error(fmt::format("failed({}) to make buffer strategy", e.what()));
-    }
-    auto s = strategy_->Setup();
-    if (s.Failure()) [[unlikely]] {
-        strategy_.reset();
-        return s;
-    }
-    auto view = MakeStrategyView(strategy_.get());
+    Rs::TransBufferConfigView view{
+        config.shareBufferEnable,
+        config.cacheLoadBackendOnly,
+        config.ioDirect,
+        reinterpret_cast<const uint8_t*>(config.uniqueId.data()),
+        config.uniqueId.size(),
+        config.deviceId,
+        config.shardSize,
+        config.bufferCapacity,
+        config.loadExclusiveBufferNumber,
+    };
+    auto callbacks = MakeCallbacks();
     Rs::Status rsStatus{};
-    core_ = Rs::ucm_cache_store_trans_buffer_new(&view, bypassHitOnLoad_, &rsStatus);
-    s = Rs::ToUcStatus(rsStatus);
-    if (s.Failure()) [[unlikely]] {
-        strategy_.reset();
-        return s;
-    }
-    if (!core_) [[unlikely]] {
-        strategy_.reset();
-        return Status::Error("failed to create rust trans buffer core");
-    }
+    core_ = Rs::ucm_cache_store_trans_buffer_new(&view, &callbacks, &rsStatus);
+    auto s = Rs::ToUcStatus(rsStatus);
+    if (s.Failure()) [[unlikely]] { return s; }
+    if (!core_) [[unlikely]] { return Status::Error("failed to create rust trans buffer core"); }
     return Status::OK();
 }
 
@@ -602,7 +290,10 @@ bool TransBuffer::Exist(const Detail::BlockId& blockId, size_t shardIdx)
     return exist;
 }
 
-void* TransBuffer::DataAt(Index pos) { return strategy_->DataAt(pos); }
+void* TransBuffer::DataAt(Index pos)
+{
+    return core_ ? Rs::ucm_cache_store_trans_buffer_data_at(core_, pos) : nullptr;
+}
 
 void TransBuffer::Acquire(Index pos)
 {

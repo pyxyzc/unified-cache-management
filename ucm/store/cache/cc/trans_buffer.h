@@ -25,7 +25,6 @@
 #define UNIFIEDCACHE_CACHE_STORE_CC_TRANS_BUFFER_H
 
 #include <limits>
-#include <memory>
 #include "cache_store_rs.h"
 #include "global_config.h"
 #include "status/status.h"
@@ -33,14 +32,10 @@
 
 namespace UC::CacheStore {
 
-class BufferStrategy;
-
 class TransBuffer {
     using Index = std::size_t;
     static constexpr Index npos = std::numeric_limits<Index>::max();
-    std::shared_ptr<BufferStrategy> strategy_{nullptr};
     Rs::TransBufferCore* core_{nullptr};
-    bool bypassHitOnLoad_{false};
 
 public:
     class Handle {
