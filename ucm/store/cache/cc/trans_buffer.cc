@@ -46,23 +46,11 @@ static inline size_t Hash(const Detail::BlockId& blockId, size_t shard)
     return (h1 ^ (h2 + goldenSection + (h1 << 6) + (h1 >> 2))) % nHashTableBucket;
 }
 
-struct BufferMetaNode {
-    Detail::BlockId block;
-    size_t shard;
-    size_t reference;
-    size_t hash;
-    size_t prev;
-    size_t next;
-    bool ready;
-    void Init()
-    {
-        reference = 0;
-        hash = invalidIndex;
-        prev = invalidIndex;
-        next = invalidIndex;
-        ready = false;
-    }
-};
+using BufferMetaNode = Rs::TransBufferMetaNode;
+
+static_assert(sizeof(Detail::BlockId) == sizeof(Rs::BlockId));
+static_assert(alignof(Detail::BlockId) == alignof(Rs::BlockId));
+static_assert(offsetof(BufferMetaNode, block) == 0);
 
 class BufferStrategy {
 protected:
@@ -462,8 +450,91 @@ public:
     void* DataAt(size_t iNode) override { return nullptr; }
 };
 
+static const Detail::BlockId& ToDetailBlockId(const Rs::BlockId* block)
+{
+    return *reinterpret_cast<const Detail::BlockId*>(block);
+}
+
+static const Rs::BlockId* ToRsBlockId(const Detail::BlockId& block)
+{
+    return reinterpret_cast<const Rs::BlockId*>(&block);
+}
+
+static size_t StrategyBucketOf(void*, const Rs::BlockId* block, size_t shard)
+{
+    return Hash(ToDetailBlockId(block), shard);
+}
+
+static void StrategyBucketLock(void* ctx, size_t iBucket)
+{
+    static_cast<BufferStrategy*>(ctx)->BucketLock(iBucket);
+}
+
+static bool StrategyBucketTryLock(void* ctx, size_t iBucket)
+{
+    return static_cast<BufferStrategy*>(ctx)->BucketTryLock(iBucket);
+}
+
+static void StrategyBucketUnlock(void* ctx, size_t iBucket)
+{
+    static_cast<BufferStrategy*>(ctx)->BucketUnlock(iBucket);
+}
+
+static void StrategyNodeLock(void* ctx, size_t iNode)
+{
+    static_cast<BufferStrategy*>(ctx)->NodeLock(iNode);
+}
+
+static void StrategyNodeUnlock(void* ctx, size_t iNode)
+{
+    static_cast<BufferStrategy*>(ctx)->NodeUnlock(iNode);
+}
+
+static size_t* StrategyFirstAt(void* ctx, size_t iBucket)
+{
+    return &static_cast<BufferStrategy*>(ctx)->FirstAt(iBucket);
+}
+
+static size_t StrategyFetchNode(void* ctx, bool allowReserved)
+{
+    return static_cast<BufferStrategy*>(ctx)->FetchNode(allowReserved);
+}
+
+static Rs::TransBufferMetaNode* StrategyMetaAt(void* ctx, size_t iNode)
+{
+    return static_cast<BufferStrategy*>(ctx)->MetaAt(iNode);
+}
+
+static Rs::TransBufferStrategyView MakeStrategyView(BufferStrategy* strategy)
+{
+    return {
+        strategy,
+        &StrategyBucketOf,
+        &StrategyBucketLock,
+        &StrategyBucketTryLock,
+        &StrategyBucketUnlock,
+        &StrategyNodeLock,
+        &StrategyNodeUnlock,
+        &StrategyFirstAt,
+        &StrategyFetchNode,
+        &StrategyMetaAt,
+    };
+}
+
+TransBuffer::~TransBuffer() { ResetCore(); }
+
+void TransBuffer::ResetCore() noexcept
+{
+    if (core_) {
+        Rs::ucm_cache_store_trans_buffer_free(core_);
+        core_ = nullptr;
+    }
+}
+
 Status TransBuffer::Setup(const Config& config)
 {
+    ResetCore();
+    strategy_.reset();
     bypassHitOnLoad_ = config.cacheLoadBackendOnly;
     try {
         if (!config.shareBufferEnable) {
@@ -480,178 +551,82 @@ Status TransBuffer::Setup(const Config& config)
     } catch (const std::exception& e) {
         return Status::Error(fmt::format("failed({}) to make buffer strategy", e.what()));
     }
-    return strategy_->Setup();
+    auto s = strategy_->Setup();
+    if (s.Failure()) [[unlikely]] {
+        strategy_.reset();
+        return s;
+    }
+    auto view = MakeStrategyView(strategy_.get());
+    Rs::Status rsStatus{};
+    core_ = Rs::ucm_cache_store_trans_buffer_new(&view, bypassHitOnLoad_, &rsStatus);
+    s = Rs::ToUcStatus(rsStatus);
+    if (s.Failure()) [[unlikely]] {
+        strategy_.reset();
+        return s;
+    }
+    if (!core_) [[unlikely]] {
+        strategy_.reset();
+        return Status::Error("failed to create rust trans buffer core");
+    }
+    return Status::OK();
 }
 
 TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shardIdx,
                                      bool allowReserved, bool isLoad)
 {
-    auto iBucket = Hash(blockId, shardIdx);
-    bool owner = false;
-    strategy_->BucketLock(iBucket);
-    auto iNode = FindAt(iBucket, blockId, shardIdx, owner);
-    if (iNode != invalidIndex) {
-        if (bypassHitOnLoad_ && isLoad && owner && Ready(iNode)) { MarkNotReady(iNode); }
-        strategy_->BucketUnlock(iBucket);
-        return Handle{this, iNode, owner};
+    if (!core_) [[unlikely]] { return {}; }
+    Rs::TransBufferGetResult result{};
+    Rs::Status rsStatus{};
+    Rs::ucm_cache_store_trans_buffer_get(core_, ToRsBlockId(blockId), shardIdx, allowReserved,
+                                         isLoad, &result, &rsStatus);
+    auto s = Rs::ToUcStatus(rsStatus);
+    if (s.Failure()) [[unlikely]] {
+        UC_ERROR("Failed({}) to get trans buffer shard({}).", s, shardIdx);
+        return {};
     }
-    iNode = Alloc(blockId, shardIdx, iBucket, allowReserved);
-    strategy_->BucketUnlock(iBucket);
-    return Handle(this, iNode, true);
+    return Handle(this, result.index, result.owner);
 }
 
 bool TransBuffer::Exist(const Detail::BlockId& blockId, size_t shardIdx)
 {
-    auto iBucket = Hash(blockId, shardIdx);
-    strategy_->BucketLock(iBucket);
-    auto exist = ExistAt(iBucket, blockId, shardIdx);
-    strategy_->BucketUnlock(iBucket);
+    if (!core_) [[unlikely]] { return false; }
+    bool exist = false;
+    Rs::Status rsStatus{};
+    Rs::ucm_cache_store_trans_buffer_exist(core_, ToRsBlockId(blockId), shardIdx, &exist,
+                                           &rsStatus);
+    auto s = Rs::ToUcStatus(rsStatus);
+    if (s.Failure()) [[unlikely]] {
+        UC_ERROR("Failed({}) to check trans buffer shard({}).", s, shardIdx);
+        return false;
+    }
     return exist;
-}
-
-bool TransBuffer::ExistAt(size_t iBucket, const Detail::BlockId& blockId, size_t shardIdx)
-{
-    auto iNode = strategy_->FirstAt(iBucket);
-    while (iNode != invalidIndex) {
-        auto meta = strategy_->MetaAt(iNode);
-        strategy_->NodeLock(iNode);
-        if (meta->block == blockId && meta->shard == shardIdx) {
-            strategy_->NodeUnlock(iNode);
-            return true;
-        }
-        auto next = meta->next;
-        strategy_->NodeUnlock(iNode);
-        iNode = next;
-    }
-    return false;
-}
-
-size_t TransBuffer::FindAt(size_t iBucket, const Detail::BlockId& blockId, size_t shardIdx,
-                           bool& owner)
-{
-    auto iNode = strategy_->FirstAt(iBucket);
-    while (iNode != invalidIndex) {
-        auto meta = strategy_->MetaAt(iNode);
-        strategy_->NodeLock(iNode);
-        if (meta->block == blockId && meta->shard == shardIdx) {
-            owner = meta->reference == 0;
-            ++meta->reference;
-            strategy_->NodeUnlock(iNode);
-            break;
-        }
-        auto next = meta->next;
-        strategy_->NodeUnlock(iNode);
-        iNode = next;
-    }
-    return iNode;
-}
-
-size_t TransBuffer::Alloc(const Detail::BlockId& blockId, size_t shardIdx, size_t iBucket,
-                          bool allowReserved)
-{
-    for (;;) {
-        auto iNode = strategy_->FetchNode(allowReserved);
-        auto meta = strategy_->MetaAt(iNode);
-        strategy_->NodeLock(iNode);
-        if (meta->reference > 0) {
-            strategy_->NodeUnlock(iNode);
-            continue;
-        }
-        const auto oldBucket = meta->hash;
-        if (oldBucket != iBucket) {
-            if (oldBucket != invalidIndex) {
-                if (!strategy_->BucketTryLock(oldBucket)) {
-                    strategy_->NodeUnlock(iNode);
-                    continue;
-                }
-                Remove(oldBucket, iNode);
-                strategy_->BucketUnlock(oldBucket);
-            }
-            MoveTo(iBucket, iNode);
-        }
-        ++meta->reference;
-        meta->block = blockId;
-        meta->shard = shardIdx;
-        meta->ready = false;
-        strategy_->NodeUnlock(iNode);
-        return iNode;
-    }
-}
-
-void TransBuffer::MoveTo(size_t iBucket, size_t iNode)
-{
-    auto meta = strategy_->MetaAt(iNode);
-    auto& head = strategy_->FirstAt(iBucket);
-    auto n = head;
-    meta->next = n;
-    if (n != invalidIndex) {
-        auto next = strategy_->MetaAt(n);
-        strategy_->NodeLock(n);
-        next->prev = iNode;
-        strategy_->NodeUnlock(n);
-    }
-    meta->hash = iBucket;
-    head = iNode;
-}
-
-void TransBuffer::Remove(size_t iBucket, size_t iNode)
-{
-    auto meta = strategy_->MetaAt(iNode);
-    auto p = meta->prev;
-    if (p != invalidIndex) {
-        auto prev = strategy_->MetaAt(p);
-        strategy_->NodeLock(p);
-        prev->next = meta->next;
-        strategy_->NodeUnlock(p);
-    }
-    auto n = meta->next;
-    if (n != invalidIndex) {
-        auto next = strategy_->MetaAt(n);
-        strategy_->NodeLock(n);
-        next->prev = meta->prev;
-        strategy_->NodeUnlock(n);
-    }
-    if (strategy_->FirstAt(iBucket) == iNode) { strategy_->FirstAt(iBucket) = n; }
-    meta->prev = meta->next = invalidIndex;
-    meta->hash = invalidIndex;
 }
 
 void* TransBuffer::DataAt(Index pos) { return strategy_->DataAt(pos); }
 
 void TransBuffer::Acquire(Index pos)
 {
-    strategy_->NodeLock(pos);
-    ++strategy_->MetaAt(pos)->reference;
-    strategy_->NodeUnlock(pos);
+    if (core_) { Rs::ucm_cache_store_trans_buffer_acquire(core_, pos); }
 }
 
 void TransBuffer::Release(Index pos)
 {
-    strategy_->NodeLock(pos);
-    --strategy_->MetaAt(pos)->reference;
-    strategy_->NodeUnlock(pos);
+    if (core_) { Rs::ucm_cache_store_trans_buffer_release(core_, pos); }
 }
 
 bool TransBuffer::Ready(Index pos)
 {
-    strategy_->NodeLock(pos);
-    auto ready = strategy_->MetaAt(pos)->ready;
-    strategy_->NodeUnlock(pos);
-    return ready;
+    return core_ ? Rs::ucm_cache_store_trans_buffer_ready(core_, pos) : false;
 }
 
 void TransBuffer::MarkReady(Index pos)
 {
-    strategy_->NodeLock(pos);
-    strategy_->MetaAt(pos)->ready = true;
-    strategy_->NodeUnlock(pos);
+    if (core_) { Rs::ucm_cache_store_trans_buffer_mark_ready(core_, pos); }
 }
 
 void TransBuffer::MarkNotReady(Index pos)
 {
-    strategy_->NodeLock(pos);
-    strategy_->MetaAt(pos)->ready = false;
-    strategy_->NodeUnlock(pos);
+    if (core_) { Rs::ucm_cache_store_trans_buffer_mark_not_ready(core_, pos); }
 }
 
 }  // namespace UC::CacheStore

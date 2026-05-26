@@ -24,12 +24,16 @@
 #ifndef UNIFIEDCACHE_CACHE_STORE_CC_BUFFER_MANAGER_H
 #define UNIFIEDCACHE_CACHE_STORE_CC_BUFFER_MANAGER_H
 
+#include "cache_store_rs.h"
 #include "logger/logger.h"
 #include "time/stopwatch.h"
 #include "trans_buffer.h"
 #include "ucmstore_v1.h"
 
 namespace UC::CacheStore {
+
+static_assert(sizeof(Detail::BlockId) == sizeof(Rs::BlockId));
+static_assert(alignof(Detail::BlockId) == alignof(Rs::BlockId));
 
 class BufferManager {
     std::unique_ptr<TransBuffer> buffer_{nullptr};
@@ -76,28 +80,75 @@ public:
     }
 
 private:
-    void Lookup(const Detail::BlockId* blocks, size_t num, std::vector<uint8_t>& results,
-                std::vector<Detail::BlockId>& missBlk, std::vector<size_t>& missIdx)
+    static const Rs::BlockId* ToRsBlockIds(const Detail::BlockId* blocks)
+    {
+        return reinterpret_cast<const Rs::BlockId*>(blocks);
+    }
+
+    static Rs::BlockId* ToRsBlockIds(Detail::BlockId* blocks)
+    {
+        return reinterpret_cast<Rs::BlockId*>(blocks);
+    }
+
+    void LookupLocal(const Detail::BlockId* blocks, size_t num, std::vector<uint8_t>& results)
     {
         results.reserve(num);
-        missBlk.reserve(num);
-        missIdx.reserve(num);
         StopWatch sw;
         for (size_t i = 0; i < num; ++i) {
             uint8_t hit = buffer_->Exist(blocks[i], 0);
             results.push_back(hit);
-            if (hit) { continue; }
-            missBlk.push_back(blocks[i]);
-            missIdx.push_back(i);
         }
         UC_DEBUG("Cache lookup({}) costs {:.3f}ms.", num, sw.Elapsed().count() * 1e3);
     }
+
+    Status CollectMisses(const Detail::BlockId* blocks, size_t num,
+                         const std::vector<uint8_t>& results,
+                         std::vector<Detail::BlockId>& missBlk, std::vector<size_t>& missIdx)
+    {
+        missBlk.resize(num);
+        missIdx.resize(num);
+        size_t missCount = 0;
+        Rs::Status rsStatus{};
+        Rs::ucm_cache_store_lookup_collect_misses(
+            ToRsBlockIds(blocks), results.data(), num, ToRsBlockIds(missBlk.data()),
+            missIdx.data(), &missCount, &rsStatus);
+        auto s = Rs::ToUcStatus(rsStatus);
+        if (s.Failure()) { return s; }
+        missBlk.resize(missCount);
+        missIdx.resize(missCount);
+        return Status::OK();
+    }
+
+    Status MergeLookupResults(std::vector<uint8_t>& results, const std::vector<size_t>& missIdx,
+                              const std::vector<uint8_t>& backendVec)
+    {
+        Rs::Status rsStatus{};
+        Rs::ucm_cache_store_lookup_merge(results.data(), results.size(), missIdx.data(),
+                                         missIdx.size(), backendVec.data(), backendVec.size(),
+                                         &rsStatus);
+        return Rs::ToUcStatus(rsStatus);
+    }
+
+    Expected<ssize_t> PrefixResult(size_t num, const std::vector<size_t>& missIdx,
+                                   ssize_t backendResult)
+    {
+        ssize_t result = -1;
+        Rs::Status rsStatus{};
+        Rs::ucm_cache_store_lookup_prefix_result(num, missIdx.data(), missIdx.size(),
+                                                 backendResult, &result, &rsStatus);
+        auto s = Rs::ToUcStatus(rsStatus);
+        if (s.Failure()) { return s; }
+        return static_cast<ssize_t>(result);
+    }
+
     Expected<std::vector<uint8_t>> LookupFast(const Detail::BlockId* blocks, size_t num)
     {
         std::vector<uint8_t> results;
         std::vector<Detail::BlockId> missBlk;
         std::vector<size_t> missIdx;
-        Lookup(blocks, num, results, missBlk, missIdx);
+        LookupLocal(blocks, num, results);
+        auto s = CollectMisses(blocks, num, results, missBlk, missIdx);
+        if (s.Failure()) [[unlikely]] { return s; }
         if (missBlk.empty()) { return results; }
         StopWatch sw;
         auto res = backend_->Lookup(missBlk.data(), missBlk.size());
@@ -105,7 +156,8 @@ private:
         UC_DEBUG("Cache lookup({}/{}) in backend costs {:.3f}ms.", missBlk.size(), num,
                  sw.Elapsed().count() * 1e3);
         const auto& backendVec = res.Value();
-        for (size_t i = 0; i < missIdx.size(); ++i) { results[missIdx[i]] = backendVec[i]; }
+        s = MergeLookupResults(results, missIdx, backendVec);
+        if (s.Failure()) [[unlikely]] { return s; }
         return results;
     }
     Expected<ssize_t> LookupOnPrefixFast(const Detail::BlockId* blocks, size_t num)
@@ -113,18 +165,16 @@ private:
         std::vector<uint8_t> results;
         std::vector<Detail::BlockId> missBlk;
         std::vector<size_t> missIdx;
-        Lookup(blocks, num, results, missBlk, missIdx);
-        if (missBlk.empty()) { return static_cast<ssize_t>(num) - 1; }
+        LookupLocal(blocks, num, results);
+        auto s = CollectMisses(blocks, num, results, missBlk, missIdx);
+        if (s.Failure()) [[unlikely]] { return s; }
+        if (missBlk.empty()) { return PrefixResult(num, missIdx, -1); }
         StopWatch sw;
         auto res = backend_->LookupOnPrefix(missBlk.data(), missBlk.size());
         if (!res) [[unlikely]] { return res.Error(); }
         UC_DEBUG("Cache lookup({}/{}) in backend costs {:.3f}ms.", missBlk.size(), num,
                  sw.Elapsed().count() * 1e3);
-        const auto& result = res.Value();
-        if (static_cast<size_t>(result + 1) == missIdx.size()) {
-            return static_cast<ssize_t>(num) - 1;
-        }
-        return static_cast<ssize_t>(missIdx[result + 1]) - 1;
+        return PrefixResult(num, missIdx, res.Value());
     }
 };
 

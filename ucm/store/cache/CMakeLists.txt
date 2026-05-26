@@ -2,6 +2,9 @@ find_program(CARGO_EXECUTABLE cargo REQUIRED)
 
 set(UCM_CACHE_STORE_RS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rs)
 set(UCM_CACHE_STORE_RS_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/rust-target)
+file(GLOB_RECURSE UCM_CACHE_STORE_RS_SOURCE_FILES
+    CONFIGURE_DEPENDS
+    ${UCM_CACHE_STORE_RS_DIR}/src/*.rs)
 if(CMAKE_BUILD_TYPE_LOWER STREQUAL "debug")
     set(UCM_CACHE_STORE_RS_PROFILE debug)
     set(UCM_CACHE_STORE_RS_BUILD_ARGS build --manifest-path ${UCM_CACHE_STORE_RS_DIR}/Cargo.toml)
@@ -21,7 +24,7 @@ add_custom_command(
         ${UCM_CACHE_STORE_RS_DIR}/Cargo.toml
         ${UCM_CACHE_STORE_RS_DIR}/Cargo.lock
         ${UCM_CACHE_STORE_RS_DIR}/.cargo/config.toml
-        ${UCM_CACHE_STORE_RS_DIR}/src/lib.rs
+        ${UCM_CACHE_STORE_RS_SOURCE_FILES}
     COMMENT "Building Rust CacheStore core"
     VERBATIM)
 

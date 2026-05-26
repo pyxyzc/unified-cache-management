@@ -162,23 +162,6 @@ private:
         return view;
     }
 
-    static std::string MessageFrom(const Rs::Status& status)
-    {
-        size_t len = 0;
-        while (len < Rs::MESSAGE_CAPACITY && status.message[len] != '\0') { ++len; }
-        return std::string{status.message, len};
-    }
-
-    static Status ToStatus(const Rs::Status& status)
-    {
-        if (status.code == Rs::STATUS_OK) { return Status::OK(); }
-        auto message = MessageFrom(status);
-        if (status.code == Rs::STATUS_INVALID_PARAM) {
-            return Status::InvalidParam(std::move(message));
-        }
-        return Status::Error(std::move(message));
-    }
-
     void ResetCore() noexcept
     {
         if (core_) {
@@ -194,7 +177,7 @@ private:
         auto view = MakeConfigView(config);
         Rs::Status rsStatus{};
         core_ = Rs::ucm_cache_store_core_new(&view, &rsStatus);
-        auto s = ToStatus(rsStatus);
+        auto s = Rs::ToUcStatus(rsStatus);
         if (s.Failure()) { return s; }
         if (!core_) { return Status::Error("failed to create rust cache core"); }
         return Status::OK();

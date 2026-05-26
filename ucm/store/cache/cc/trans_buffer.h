@@ -26,6 +26,7 @@
 
 #include <limits>
 #include <memory>
+#include "cache_store_rs.h"
 #include "global_config.h"
 #include "status/status.h"
 #include "type/types.h"
@@ -38,6 +39,7 @@ class TransBuffer {
     using Index = std::size_t;
     static constexpr Index npos = std::numeric_limits<Index>::max();
     std::shared_ptr<BufferStrategy> strategy_{nullptr};
+    Rs::TransBufferCore* core_{nullptr};
     bool bypassHitOnLoad_{false};
 
 public:
@@ -98,18 +100,14 @@ public:
     };
 
 public:
+    ~TransBuffer();
     Status Setup(const Config& config);
     Handle Get(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false,
                bool isLoad = false);
     bool Exist(const Detail::BlockId& blockId, size_t shardIdx);
 
 private:
-    bool ExistAt(size_t iBucket, const Detail::BlockId& blockId, size_t shardIdx);
-    size_t FindAt(size_t iBucket, const Detail::BlockId& blockId, size_t shardIdx, bool& owner);
-    size_t Alloc(const Detail::BlockId& blockId, size_t shardIdx, size_t iBucket,
-                 bool allowReserved = false);
-    void MoveTo(size_t iBucket, size_t iNode);
-    void Remove(size_t iBucket, size_t iNode);
+    void ResetCore() noexcept;
     void* DataAt(Index pos);
     void Acquire(Index pos);
     void Release(Index pos);

@@ -39,6 +39,27 @@ protected:
         std::vector<uint8_t> founds(num, true);
         return founds;
     }
+    static UC::CacheStore::Config MakeLocalCacheConfig(UC::Test::Detail::MockStore& backend,
+                                                       UC::Test::Detail::Random& rd)
+    {
+        UC::CacheStore::Config config;
+        config.storeBackend = &backend;
+        config.deviceId = 0;
+        config.tensorSizes = {4096};
+        config.shardSize = 4096;
+        config.blockSize = config.shardSize;
+        config.bufferCapacity = config.shardSize * 1024;
+        config.uniqueId = rd.RandomString(10);
+        config.shareBufferEnable = false;
+        return config;
+    }
+    static void PutLocalHit(UC::CacheStore::BufferManager& bufferMgr,
+                            const UC::Detail::BlockId& block)
+    {
+        auto handle = bufferMgr.GetTransBuffer()->Get(block, 0, true);
+        ASSERT_TRUE(handle);
+        handle.MarkReady();
+    }
 };
 
 TEST_F(UCCacheBufferManagerTest, Lookup)
@@ -82,6 +103,81 @@ TEST_F(UCCacheBufferManagerTest, Lookup)
         ASSERT_EQ(founds.size(), blocks.size());
         std::for_each(founds.begin(), founds.end(), [](auto found) { ASSERT_TRUE(found); });
     }
+}
+
+TEST_F(UCCacheBufferManagerTest, LookupMergesLocalAndBackendResults)
+{
+    UC::Test::Detail::MockStore backend;
+    UC::Test::Detail::Random rd;
+    UC::CacheStore::BufferManager bufferMgr;
+    auto config = MakeLocalCacheConfig(backend, rd);
+    ASSERT_TRUE(bufferMgr.Setup(config).Success());
+
+    std::vector<UC::Detail::BlockId> blocks(4);
+    std::for_each(blocks.begin(), blocks.end(), [](auto& block) {
+        block = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
+    });
+    PutLocalHit(bufferMgr, blocks[0]);
+    PutLocalHit(bufferMgr, blocks[2]);
+
+    EXPECT_CALL(backend, Lookup(testing::_, 2))
+        .WillOnce(testing::Invoke([&blocks](const UC::Detail::BlockId* miss, size_t num) {
+            EXPECT_EQ(num, 2);
+            EXPECT_EQ(miss[0], blocks[1]);
+            EXPECT_EQ(miss[1], blocks[3]);
+            return UC::Expected<std::vector<uint8_t>>(std::vector<uint8_t>{true, false});
+        }));
+
+    auto founds = bufferMgr.Lookup(blocks.data(), blocks.size()).Value();
+    ASSERT_EQ(founds.size(), blocks.size());
+    EXPECT_TRUE(founds[0]);
+    EXPECT_TRUE(founds[1]);
+    EXPECT_TRUE(founds[2]);
+    EXPECT_FALSE(founds[3]);
+}
+
+TEST_F(UCCacheBufferManagerTest, LookupOnPrefixMapsBackendMissesToOriginalIndex)
+{
+    UC::Test::Detail::MockStore backend;
+    UC::Test::Detail::Random rd;
+    UC::CacheStore::BufferManager bufferMgr;
+    auto config = MakeLocalCacheConfig(backend, rd);
+    ASSERT_TRUE(bufferMgr.Setup(config).Success());
+
+    std::vector<UC::Detail::BlockId> blocks(4);
+    std::for_each(blocks.begin(), blocks.end(), [](auto& block) {
+        block = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
+    });
+    PutLocalHit(bufferMgr, blocks[0]);
+    PutLocalHit(bufferMgr, blocks[2]);
+
+    EXPECT_CALL(backend, LookupOnPrefix(testing::_, 2))
+        .WillOnce(testing::Invoke([&blocks](const UC::Detail::BlockId* miss, size_t num) {
+            EXPECT_EQ(num, 2);
+            EXPECT_EQ(miss[0], blocks[1]);
+            EXPECT_EQ(miss[1], blocks[3]);
+            return UC::Expected<ssize_t>(static_cast<ssize_t>(0));
+        }));
+
+    ASSERT_EQ(bufferMgr.LookupOnPrefix(blocks.data(), blocks.size()).Value(), 2);
+}
+
+TEST_F(UCCacheBufferManagerTest, LookupOnPrefixAllLocalHitsSkipsBackend)
+{
+    UC::Test::Detail::MockStore backend;
+    UC::Test::Detail::Random rd;
+    UC::CacheStore::BufferManager bufferMgr;
+    auto config = MakeLocalCacheConfig(backend, rd);
+    ASSERT_TRUE(bufferMgr.Setup(config).Success());
+
+    std::vector<UC::Detail::BlockId> blocks(3);
+    std::for_each(blocks.begin(), blocks.end(), [](auto& block) {
+        block = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
+    });
+    for (const auto& block : blocks) { PutLocalHit(bufferMgr, block); }
+
+    EXPECT_CALL(backend, LookupOnPrefix).Times(0);
+    ASSERT_EQ(bufferMgr.LookupOnPrefix(blocks.data(), blocks.size()).Value(), 2);
 }
 
 TEST_F(UCCacheBufferManagerTest, BackendOnlyLookupBypassesCache)
