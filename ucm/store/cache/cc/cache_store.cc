@@ -21,8 +21,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
-#include <numeric>
+#include <algorithm>
 #include "buffer_manager.h"
+#include "cache_store_rs.h"
 #include "logger/logger.h"
 #include "trans_manager.h"
 
@@ -32,12 +33,14 @@ class CacheStore : public StoreV1 {
     BufferManager bufferMgr_;
     bool transEnable_{false};
     TransManager transMgr_;
+    Rs::Core* core_{nullptr};
 
 public:
+    ~CacheStore() override { ResetCore(); }
     Status Setup(const Detail::Dictionary& inConfig) override
     {
         auto config = ParseConfig(inConfig);
-        auto s = CheckConfig(config);
+        auto s = SetupCore(config);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed to check config params: {}.", s);
             return s;
@@ -45,12 +48,16 @@ public:
         s = bufferMgr_.Setup(config);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to setup buffer manager.", s);
+            ResetCore();
             return s;
         }
-        transEnable_ = config.deviceId >= 0;
+        transEnable_ = Rs::ucm_cache_store_core_trans_enabled(core_);
         if (transEnable_) {
             s = transMgr_.Setup(config, bufferMgr_.GetTransBuffer());
-            if (s.Failure()) [[unlikely]] { return s; }
+            if (s.Failure()) [[unlikely]] {
+                ResetCore();
+                return s;
+            }
         }
         ShowConfig(config);
         return Status::OK();
@@ -132,49 +139,67 @@ private:
         config.GetNumber("cache_load_exclusive_buffer_number", param.loadExclusiveBufferNumber);
         return param;
     }
-    Status CheckSizeConfig(const Config& config)
+
+    static Rs::ConfigView MakeConfigView(const Config& config)
     {
-        if (config.tensorSizes.empty()) { return Status::InvalidParam("invalid tensor size"); }
-        if (config.shardSize == 0) { return Status::InvalidParam("invalid shard size"); }
-        if (config.blockSize == 0) { return Status::InvalidParam("invalid block size"); }
-        if (std::accumulate(config.tensorSizes.begin(), config.tensorSizes.end(), size_t(0)) !=
-            config.shardSize) {
-            return Status::InvalidParam("invalid shard size({})", config.shardSize);
-        }
-        if (config.blockSize % config.shardSize != 0) {
-            return Status::InvalidParam("invalid block size({})", config.blockSize);
-        }
-        return Status::OK();
+        Rs::ConfigView view{};
+        view.storeBackendPresent = config.storeBackend != nullptr;
+        view.uniqueIdPtr = reinterpret_cast<const uint8_t*>(config.uniqueId.data());
+        view.uniqueIdLen = config.uniqueId.size();
+        view.deviceId = config.deviceId;
+        view.tensorSizesPtr = config.tensorSizes.data();
+        view.tensorSizesLen = config.tensorSizes.size();
+        view.shardSize = config.shardSize;
+        view.blockSize = config.blockSize;
+        view.cpuAffinityCoresPtr = config.cpuAffinityCores.data();
+        view.cpuAffinityCoresLen = config.cpuAffinityCores.size();
+        view.bufferCapacity = config.bufferCapacity;
+        view.loadExclusiveBufferNumber = config.loadExclusiveBufferNumber;
+        view.waitingQueueDepth = config.waitingQueueDepth;
+        view.runningQueueDepth = config.runningQueueDepth;
+        view.streamNumber = config.streamNumber;
+        view.cpuSetSize = CPU_SETSIZE;
+        return view;
     }
-    Status CheckConfig(const Config& config)
+
+    static std::string MessageFrom(const Rs::Status& status)
     {
-        if (!config.storeBackend) { return Status::InvalidParam("invalid store backend"); }
-        if (config.deviceId < -1) {
-            return Status::InvalidParam("invalid device({})", config.deviceId);
+        size_t len = 0;
+        while (len < Rs::MESSAGE_CAPACITY && status.message[len] != '\0') { ++len; }
+        return std::string{status.message, len};
+    }
+
+    static Status ToStatus(const Rs::Status& status)
+    {
+        if (status.code == Rs::STATUS_OK) { return Status::OK(); }
+        auto message = MessageFrom(status);
+        if (status.code == Rs::STATUS_INVALID_PARAM) {
+            return Status::InvalidParam(std::move(message));
         }
-        if (config.uniqueId.empty()) { return Status::InvalidParam("invalid unique id"); }
-        for (const auto core : config.cpuAffinityCores) {
-            if (core < 0 || core >= CPU_SETSIZE) {
-                return Status::InvalidParam("invalid cpu core({})", core);
-            }
+        return Status::Error(std::move(message));
+    }
+
+    void ResetCore() noexcept
+    {
+        if (core_) {
+            Rs::ucm_cache_store_core_free(core_);
+            core_ = nullptr;
         }
-        if (config.deviceId == -1) { return Status::OK(); }
-        auto s = CheckSizeConfig(config);
+        transEnable_ = false;
+    }
+
+    Status SetupCore(const Config& config)
+    {
+        ResetCore();
+        auto view = MakeConfigView(config);
+        Rs::Status rsStatus{};
+        core_ = Rs::ucm_cache_store_core_new(&view, &rsStatus);
+        auto s = ToStatus(rsStatus);
         if (s.Failure()) { return s; }
-        auto bufferNumber = config.bufferCapacity / config.shardSize;
-        if (bufferNumber < 1024 || bufferNumber < config.loadExclusiveBufferNumber * 2) {
-            return Status::InvalidParam("too small buffer({}) on shard({})", config.bufferCapacity,
-                                        config.shardSize);
-        }
-        if (config.waitingQueueDepth <= 1 || config.runningQueueDepth <= 1) {
-            return Status::InvalidParam("invalid queue depth({},{})", config.waitingQueueDepth,
-                                        config.runningQueueDepth);
-        }
-        if (config.streamNumber < 1 || config.streamNumber > 32) {
-            return Status::InvalidParam("invalid stream number({})", config.streamNumber);
-        }
+        if (!core_) { return Status::Error("failed to create rust cache core"); }
         return Status::OK();
     }
+
     void ShowConfig(const Config& config)
     {
         constexpr const char* ns = "CacheStore";

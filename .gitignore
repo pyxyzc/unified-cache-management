@@ -47,6 +47,7 @@
 .git/**
 **/build/**
 **/output/**
+**/target/**
 .venv/**
 **/__pycache__/**
 *.egg-info/**

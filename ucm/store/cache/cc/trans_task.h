@@ -24,9 +24,9 @@
 #ifndef UNIFIEDCACHE_CACHE_STORE_CC_TRANS_TASK_H
 #define UNIFIEDCACHE_CACHE_STORE_CC_TRANS_TASK_H
 
-#include <atomic>
 #include <cstdint>
 #include <string>
+#include "cache_store_rs.h"
 #include "type/types.h"
 
 namespace UC::CacheStore {
@@ -46,8 +46,7 @@ public:
 private:
     static size_t NextId() noexcept
     {
-        static std::atomic<size_t> id{1};
-        return id.fetch_add(1, std::memory_order_relaxed);
+        return Rs::ucm_cache_store_next_task_id();
     };
 };
 
