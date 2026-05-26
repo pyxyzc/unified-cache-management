@@ -24,6 +24,14 @@ repos:
     hooks:
       - id: actionlint
         exclude: \.(jsonl|txt)$
+  - repo: local
+    hooks:
+      - id: rust-format
+        name: rust-format
+        entry: bash rust-format.sh --check
+        language: system
+        files: (\.rs$|(^|/)Cargo\.toml$|(^|/)rustfmt\.toml$)
+        pass_filenames: true
 default_stages:
   - pre-commit
   - manual
