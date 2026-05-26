@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include <acl/acl.h>
+#include "ascend_rs.h"
 #include "ascend_buffer.h"
 #include "ascend_stream.h"
 #include "trans/device.h"
@@ -31,7 +32,7 @@ namespace UC::Trans {
 Status Device::Setup(int32_t deviceId)
 {
     if (deviceId < 0) { return Status::Error(fmt::format("invalid device id({})", deviceId)); }
-    auto ret = aclrtSetDevice(deviceId);
+    auto ret = ucm_ascend_trans_set_device(deviceId);
     if (ret == ACL_SUCCESS) { return Status::OK(); }
     return Status{ret, std::to_string(ret)};
 }

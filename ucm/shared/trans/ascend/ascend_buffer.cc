@@ -24,6 +24,7 @@
 #include "ascend_buffer.h"
 #include <acl/acl.h>
 #include <sys/mman.h>
+#include "ascend_rs.h"
 #include "logger/logger.h"
 
 namespace UC::Trans {
@@ -111,16 +112,24 @@ public:
 std::shared_ptr<void> Trans::AscendBuffer::MakeDeviceBuffer(size_t size)
 {
     void* device = nullptr;
-    auto ret = aclrtMalloc(&device, size, ACL_MEM_TYPE_HIGH_BAND_WIDTH);
-    if (ret == ACL_SUCCESS) { return std::shared_ptr<void>(device, aclrtFree); }
+    auto ret = ucm_ascend_trans_malloc_device(&device, size);
+    if (ret == ACL_SUCCESS) {
+        return std::shared_ptr<void>(device, [](void* ptr) {
+            (void)ucm_ascend_trans_free_device(ptr);
+        });
+    }
     return nullptr;
 }
 
 std::shared_ptr<void> Trans::AscendBuffer::MakeHostBuffer(size_t size)
 {
     void* host = nullptr;
-    auto ret = aclrtMallocHost(&host, size);
-    if (ret == ACL_SUCCESS) { return std::shared_ptr<void>(host, aclrtFreeHost); }
+    auto ret = ucm_ascend_trans_malloc_host(&host, size);
+    if (ret == ACL_SUCCESS) {
+        return std::shared_ptr<void>(host, [](void* ptr) {
+            (void)ucm_ascend_trans_free_host(ptr);
+        });
+    }
     return nullptr;
 }
 
@@ -137,17 +146,17 @@ Status Buffer::RegisterHostBuffer(void* host, size_t size, void** pDevice)
 {
     void* device = nullptr;
 #if ASCEND_SUPPORTS_REGISTER_PIN
-    auto ret = aclrtHostRegisterV2(host, size, ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED);
+    auto ret = ucm_ascend_trans_host_register_v2(host, size);
     if (ret != ACL_SUCCESS) [[unlikely]] { return Status{ret, std::to_string(ret)}; }
-    if (pDevice) { ret = aclrtHostGetDevicePointer(host, &device, 0); }
+    if (pDevice) { ret = ucm_ascend_trans_host_get_device_pointer(host, &device); }
 #else
-    auto ret = aclrtHostRegister(host, size, ACL_HOST_REGISTER_MAPPED, &device);
+    auto ret = ucm_ascend_trans_host_register(host, size, &device);
 #endif
     if (ret != ACL_SUCCESS) [[unlikely]] { return Status{ret, std::to_string(ret)}; }
     if (pDevice) { *pDevice = device; }
     return Status::OK();
 }
 
-void Buffer::UnregisterHostBuffer(void* host) { aclrtHostUnregister(host); }
+void Buffer::UnregisterHostBuffer(void* host) { (void)ucm_ascend_trans_host_unregister(host); }
 
 }  // namespace UC::Trans

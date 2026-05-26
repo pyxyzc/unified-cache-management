@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include "ascend_stream.h"
+#include "ascend_rs.h"
 
 namespace UC::Trans {
 
@@ -29,33 +30,32 @@ AscendStream::~AscendStream()
 {
     if (cbThread_.joinable()) {
         auto tid = cbThread_.native_handle();
-        (void)aclrtUnSubscribeReport(tid, stream_);
+        (void)ucm_ascend_trans_unsubscribe_report(static_cast<uint64_t>(tid), stream_);
         stop_ = true;
         cbThread_.join();
     }
     if (stream_) {
-        (void)aclrtDestroyStream(stream_);
+        (void)ucm_ascend_trans_destroy_stream(stream_);
         stream_ = nullptr;
     }
 }
 
 Status AscendStream::Setup()
 {
-    auto ret =
-        aclrtCreateStreamWithConfig(&stream_, 0, ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC);
+    auto ret = ucm_ascend_trans_create_stream(reinterpret_cast<void**>(&stream_));
     if (ret != ACL_SUCCESS) [[unlikely]] { return Status{ret, std::to_string(ret)}; }
     cbThread_ = std::thread([this] {
-        while (!this->stop_) { (void)aclrtProcessReport(10); }
+        while (!this->stop_) { (void)ucm_ascend_trans_process_report(10); }
     });
     auto tid = cbThread_.native_handle();
-    ret = aclrtSubscribeReport(tid, stream_);
+    ret = ucm_ascend_trans_subscribe_report(static_cast<uint64_t>(tid), stream_);
     if (ret != ACL_SUCCESS) [[unlikely]] { return Status{ret, std::to_string(ret)}; }
     return Status::OK();
 }
 
 Status AscendStream::DeviceToHost(void* device, void* host, size_t size)
 {
-    auto ret = aclrtMemcpy(host, size, device, size, ACL_MEMCPY_DEVICE_TO_HOST);
+    auto ret = ucm_ascend_trans_device_to_host(device, host, size);
     if (ret == ACL_SUCCESS) { return Status::OK(); }
     return Status{ret, std::to_string(ret)};
 }
@@ -76,7 +76,7 @@ Status AscendStream::DeviceToHost(void* device[], void* host, size_t size, size_
 
 Status AscendStream::DeviceToHostAsync(void* device, void* host, size_t size)
 {
-    auto ret = aclrtMemcpyAsync(host, size, device, size, ACL_MEMCPY_DEVICE_TO_HOST, stream_);
+    auto ret = ucm_ascend_trans_device_to_host_async(device, host, size, stream_);
     if (ret == ACL_SUCCESS) { return Status::OK(); }
     return Status{ret, std::to_string(ret)};
 }
@@ -102,7 +102,7 @@ Status AscendStream::DeviceToHostAsync(void* device[], void* host, size_t size, 
 
 Status AscendStream::HostToDevice(void* host, void* device, size_t size)
 {
-    auto ret = aclrtMemcpy(device, size, host, size, ACL_MEMCPY_HOST_TO_DEVICE);
+    auto ret = ucm_ascend_trans_host_to_device(host, device, size);
     if (ret == ACL_SUCCESS) { return Status::OK(); }
     return Status{ret, std::to_string(ret)};
 }
@@ -123,7 +123,7 @@ Status AscendStream::HostToDevice(void* host, void* device[], size_t size, size_
 
 Status AscendStream::HostToDeviceAsync(void* host, void* device, size_t size)
 {
-    auto ret = aclrtMemcpyAsync(device, size, host, size, ACL_MEMCPY_HOST_TO_DEVICE, stream_);
+    auto ret = ucm_ascend_trans_host_to_device_async(host, device, size, stream_);
     if (ret == ACL_SUCCESS) { return Status::OK(); }
     return Status{ret, std::to_string(ret)};
 }
@@ -160,7 +160,7 @@ Status Trans::AscendStream::AppendCallback(std::function<void(bool)> cb)
 {
     auto c = new (std::nothrow) Closure{std::move(cb)};
     if (!c) [[unlikely]] { return Status::Error("out of memory for appending callback"); }
-    auto ret = aclrtLaunchCallback(Trampoline, (void*)c, ACL_CALLBACK_NO_BLOCK, stream_);
+    auto ret = ucm_ascend_trans_launch_callback(Trampoline, (void*)c, stream_);
     if (ret != ACL_SUCCESS) [[unlikely]] {
         delete c;
         return Status{ret, std::to_string(ret)};
@@ -170,7 +170,7 @@ Status Trans::AscendStream::AppendCallback(std::function<void(bool)> cb)
 
 Status AscendStream::Synchronized()
 {
-    auto ret = aclrtSynchronizeStream(stream_);
+    auto ret = ucm_ascend_trans_synchronize_stream(stream_);
     if (ret == ACL_SUCCESS) { return Status::OK(); }
     return Status{ret, std::to_string(ret)};
 }
@@ -178,7 +178,7 @@ Status AscendStream::Synchronized()
 Status AscendStream::WaitEvent(void* event)
 {
     if (event == nullptr) { return Status::OK(); }
-    auto ret = aclrtStreamWaitEvent(stream_, static_cast<aclrtEvent>(event));
+    auto ret = ucm_ascend_trans_stream_wait_event(stream_, event);
     if (ret != ACL_SUCCESS) [[unlikely]] { return Status{ret, std::to_string(ret)}; }
     return Status::OK();
 }
