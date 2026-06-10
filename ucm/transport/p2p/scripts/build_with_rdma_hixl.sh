@@ -4,12 +4,15 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "${ROOT_DIR}/../../.." && pwd)"
+UCM_DIR="${REPO_ROOT}/ucm"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build}"
 CXX="${CXX:-g++}"
 CXXFLAGS="${CXXFLAGS:-}"
 LDFLAGS="${LDFLAGS:-}"
 HIXL_LIBS="${HIXL_LIBS:--lcann_hixl}"
 ASCEND_LIBS="${ASCEND_LIBS:--lascendcl -lmetadef}"
+LOGGER_LIBS="${LOGGER_LIBS:--lfmt -lspdlog -lz}"
 EXTRA_LIBS="${EXTRA_LIBS:--lrt}"
 
 mkdir -p "${BUILD_DIR}"
@@ -17,7 +20,14 @@ mkdir -p "${BUILD_DIR}"
 HIXL_HEADER_FOUND=0
 INCLUDES=(
   "-I${ROOT_DIR}/include"
-  "-I${ROOT_DIR}/src"
+  "-I${ROOT_DIR}/include/core"
+  "-I${ROOT_DIR}/include/control"
+  "-I${ROOT_DIR}/include/hixl"
+  "-I${ROOT_DIR}/include/rdma"
+  "-I${ROOT_DIR}/src/core"
+  "-I${UCM_DIR}/shared/infra"
+  "-I${UCM_DIR}/shared/infra/logger"
+  "-I${UCM_DIR}/shared/infra/logger/cc"
 )
 
 LIB_DIRS=()
@@ -59,6 +69,12 @@ fi
 if [[ -n "${HIXL_LIB_DIR:-}" ]]; then
   add_lib_dir "${HIXL_LIB_DIR}"
 fi
+if [[ -n "${RDMA_INCLUDE_DIR:-}" ]]; then
+  add_include_dir "${RDMA_INCLUDE_DIR}"
+fi
+if [[ -n "${RDMA_LIB_DIR:-}" ]]; then
+  add_lib_dir "${RDMA_LIB_DIR}"
+fi
 if [[ -n "${ASCEND_ROOT:-}" ]]; then
   add_include_dir "${ASCEND_ROOT}/include"
   add_include_dir "${ASCEND_ROOT}/aarch64-linux/include"
@@ -71,6 +87,18 @@ fi
 if [[ -n "${ASCEND_LIB_DIRS:-}" ]]; then
   IFS=':' read -r -a ascend_dirs <<< "${ASCEND_LIB_DIRS}"
   for dir in "${ascend_dirs[@]}"; do
+    add_lib_dir "${dir}"
+  done
+fi
+if [[ -n "${FMT_INCLUDE_DIR:-}" ]]; then
+  add_include_dir "${FMT_INCLUDE_DIR}"
+fi
+if [[ -n "${SPDLOG_INCLUDE_DIR:-}" ]]; then
+  add_include_dir "${SPDLOG_INCLUDE_DIR}"
+fi
+if [[ -n "${LOGGER_LIB_DIRS:-}" ]]; then
+  IFS=':' read -r -a logger_dirs <<< "${LOGGER_LIB_DIRS}"
+  for dir in "${logger_dirs[@]}"; do
     add_lib_dir "${dir}"
   done
 fi
@@ -105,18 +133,21 @@ COMMON_FLAGS=(
 )
 
 SOURCES=(
-  "${ROOT_DIR}/src/transport.cpp"
-  "${ROOT_DIR}/src/transport_internal.cpp"
-  "${ROOT_DIR}/src/transport_log.cpp"
-  "${ROOT_DIR}/src/tcp_transport.cpp"
-  "${ROOT_DIR}/src/hixl_transport.cpp"
-  "${ROOT_DIR}/src/rdma_transport.cpp"
-  "${ROOT_DIR}/src/transport_manager.cpp"
+  "${UCM_DIR}/shared/infra/logger/logger.cc"
+  "${UCM_DIR}/shared/infra/logger/cc/spdlog_logger.cc"
+  "${ROOT_DIR}/src/core/transport.cpp"
+  "${ROOT_DIR}/src/core/transport_internal.cpp"
+  "${ROOT_DIR}/src/control/tcp_transport.cpp"
+  "${ROOT_DIR}/src/hixl/hixl_transport.cpp"
+  "${ROOT_DIR}/src/rdma/rdma_transport.cpp"
+  "${ROOT_DIR}/src/core/transport_manager.cpp"
 )
 
 OBJECTS=()
 for src in "${SOURCES[@]}"; do
-  obj="${BUILD_DIR}/$(basename "${src}" .cpp).o"
+  stem="$(basename "${src}")"
+  stem="${stem%.*}"
+  obj="${BUILD_DIR}/${stem}.o"
   "${CXX}" "${COMMON_FLAGS[@]}" ${CXXFLAGS} "${INCLUDES[@]}" -c "${src}" -o "${obj}"
   OBJECTS+=("${obj}")
 done
@@ -133,7 +164,7 @@ for test_name in "${TESTS[@]}"; do
     "${ROOT_DIR}/tests/e2e/${test_name}.cpp" \
     "${BUILD_DIR}/libtransport.a" \
     -o "${BUILD_DIR}/${test_name}" \
-    ${LDFLAGS} -libverbs ${HIXL_LIBS} ${ASCEND_LIBS} ${EXTRA_LIBS} -pthread
+    ${LDFLAGS} -libverbs ${HIXL_LIBS} ${ASCEND_LIBS} ${LOGGER_LIBS} ${EXTRA_LIBS} -pthread
 done
 
 echo "Built:"

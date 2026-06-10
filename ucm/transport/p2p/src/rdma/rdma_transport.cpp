@@ -1,6 +1,6 @@
-#include "rdma_transport.hpp"
+#include "rdma/rdma_transport.h"
 
-#include "transport_internal.hpp"
+#include "transport_internal.h"
 
 #include <algorithm>
 #include <array>

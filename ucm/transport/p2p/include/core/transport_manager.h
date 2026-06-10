@@ -1,9 +1,9 @@
 #pragma once
 
-#include "hixl_transport.hpp"
-#include "rdma_transport.hpp"
-#include "tcp_transport.hpp"
-#include "transport.hpp"
+#include "control/tcp_transport.h"
+#include "core/transport.h"
+#include "hixl/hixl_transport.h"
+#include "rdma/rdma_transport.h"
 
 #include <memory>
 #include <string>
@@ -14,6 +14,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 
 namespace transport {
 
@@ -39,7 +40,9 @@ class TransportManager {
 
     Status installTransport(const std::string& protocol, const InitAttrs& options);
 
-    Status createChannel(const std::vector<TcpEndpoint>& endpoints, std::vector<PeerID>& peers);
+    Status createChannel(const std::vector<TcpEndpoint>& endpoints,
+                         std::vector<PeerID>& peers,
+                         const std::string& transport_name = "");
     void stopChannelListener();
     Status shutdown();
 
@@ -55,23 +58,22 @@ class TransportManager {
     };
 
     struct PeerState {
-        bool metadata_imported = false;
-        bool data_connected = false;
         uint64_t epoch = 0;
         TcpEndpoint endpoint;
+        std::unordered_set<std::string> connected_protocols;
     };
 
-    Status exportInstalledMetadata(Metadata& out) const;
+    Status exportInstalledMetadata(Metadata& out, const std::string& transport_name) const;
     Status installInitializedTransport(const std::string& protocol, TransportPtr transport);
-    Status createSingleChannel(const TcpEndpoint& endpoint, PeerID& peer);
-    Status runChannelHandshake(TcpControlPlane& channel, PeerID& peer);
+    Status createSingleChannel(const TcpEndpoint& endpoint, PeerID& peer, const std::string& transport_name);
+    Status runChannelHandshake(TcpControlPlane& channel, PeerID& peer, const std::string& transport_name);
     Status waitAcceptedChannel(const TcpEndpoint& endpoint, TcpControlPlane& channel);
-    Status establishPeerFromMetadata(const Metadata& metadata, PeerID& peer);
+    Status establishPeerFromMetadata(const Metadata& metadata, PeerID& peer, const std::string& transport_name);
     Status startChannelListener();
     Status handleAcceptedChannel();
-    Status establishDataPlane(PeerID peer);
+    Status establishDataPlane(PeerID peer, const std::string& transport_name);
     Transport* selectTransport(TransferType type, Opcode opcode) const;
-    bool peerConnected(PeerID peer) const;
+    bool peerConnected(PeerID peer, const std::string& transport_name) const;
     PeerID allocatePeerID();
     std::string endpointKey(const TcpEndpoint& endpoint) const;
     bool appendU64(Metadata& out, uint64_t value) const;

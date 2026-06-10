@@ -1,10 +1,14 @@
-#include "tcp_transport.hpp"
-
-#include "transport_log.hpp"
+#include "control/tcp_transport.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
+#include <cstdlib>
+#include <iomanip>
+#include <sstream>
 #include <utility>
+
+#include "logger/logger.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -76,6 +80,55 @@ TcpEndpoint EndpointFromSockaddr(const sockaddr_storage& storage, socklen_t leng
     return endpoint;
 }
 
+size_t MetadataByteLimit() {
+    const char* text = std::getenv("TRANSPORT_LOG_METADATA_BYTES");
+    if (text == nullptr || *text == '\0') {
+        return 512;
+    }
+    char* end = nullptr;
+    const auto value = std::strtoull(text, &end, 10);
+    return end != nullptr && *end == '\0' ? static_cast<size_t>(value) : 512;
+}
+
+std::string MetadataSummary(const Metadata& metadata) {
+    std::ostringstream out;
+    const auto limit = std::min(metadata.size(), MetadataByteLimit());
+    out << "size=" << metadata.size() << " data=\"";
+    for (size_t i = 0; i < limit; ++i) {
+        const auto byte = metadata[i];
+        switch (byte) {
+            case '\n':
+                out << "\\n";
+                break;
+            case '\r':
+                out << "\\r";
+                break;
+            case '\t':
+                out << "\\t";
+                break;
+            case '\\':
+                out << "\\\\";
+                break;
+            case '"':
+                out << "\\\"";
+                break;
+            default:
+                if (std::isprint(byte) != 0) {
+                    out << static_cast<char>(byte);
+                } else {
+                    out << "\\x" << std::hex << std::setw(2) << std::setfill('0')
+                        << static_cast<unsigned>(byte) << std::dec;
+                }
+                break;
+        }
+    }
+    if (limit < metadata.size()) {
+        out << "...";
+    }
+    out << '"';
+    return out.str();
+}
+
 }  // namespace
 
 struct TcpControlPlane::Impl {
@@ -112,9 +165,7 @@ Status TcpControlPlane::listen(const TcpEndpoint& endpoint, int backlog) {
     if (endpoint.port == 0) {
         return Status::InvalidArgument;
     }
-    log::Message(log::Level::Debug, "tcp") << "listen begin endpoint=" << endpoint.host
-                                           << ':' << endpoint.port
-                                           << " backlog=" << backlog;
+    UC_DEBUG("transport tcp listen begin endpoint={}:{} backlog={}", endpoint.host, endpoint.port, backlog);
     close();
 
     addrinfo hints{};
@@ -126,8 +177,7 @@ Status TcpControlPlane::listen(const TcpEndpoint& endpoint, int backlog) {
     const auto port = std::to_string(endpoint.port);
     const char* host = endpoint.host.empty() ? nullptr : endpoint.host.c_str();
     if (getaddrinfo(host, port.c_str(), &hints, &results) != 0) {
-        log::Message(log::Level::Error, "tcp") << "listen getaddrinfo failed endpoint="
-                                               << endpoint.host << ':' << endpoint.port;
+        UC_ERROR("transport tcp listen getaddrinfo failed endpoint={}:{}", endpoint.host, endpoint.port);
         return Status::Failed;
     }
 
@@ -143,9 +193,7 @@ Status TcpControlPlane::listen(const TcpEndpoint& endpoint, int backlog) {
             ::listen(candidate, backlog) == 0) {
             impl_->listen_socket = candidate;
             status = Status::Ok;
-            log::Message(log::Level::Debug, "tcp") << "listen ok endpoint=" << endpoint.host
-                                                   << ':' << endpoint.port
-                                                   << " socket=" << candidate;
+            UC_DEBUG("transport tcp listen ok endpoint={}:{} socket={}", endpoint.host, endpoint.port, candidate);
             break;
         }
         CloseSocket(candidate);
@@ -153,8 +201,7 @@ Status TcpControlPlane::listen(const TcpEndpoint& endpoint, int backlog) {
 
     freeaddrinfo(results);
     if (status != Status::Ok) {
-        log::Message(log::Level::Error, "tcp") << "listen failed endpoint=" << endpoint.host
-                                               << ':' << endpoint.port;
+        UC_ERROR("transport tcp listen failed endpoint={}:{}", endpoint.host, endpoint.port);
     }
     return status;
 }
@@ -170,7 +217,7 @@ Status TcpControlPlane::accept(TcpControlPlane& channel, TcpEndpoint* remote) {
                                    reinterpret_cast<sockaddr*>(&remote_addr),
                                    &remote_len);
     if (accepted == kInvalidSocket) {
-        log::Message(log::Level::Error, "tcp") << "accept failed";
+        UC_ERROR("transport tcp accept failed");
         return Status::Failed;
     }
 
@@ -178,11 +225,9 @@ Status TcpControlPlane::accept(TcpControlPlane& channel, TcpEndpoint* remote) {
     channel.impl_->socket = accepted;
     if (remote != nullptr) {
         *remote = EndpointFromSockaddr(remote_addr, remote_len);
-        log::Message(log::Level::Debug, "tcp") << "accept ok remote=" << remote->host
-                                               << ':' << remote->port
-                                               << " socket=" << accepted;
+        UC_DEBUG("transport tcp accept ok remote={}:{} socket={}", remote->host, remote->port, accepted);
     } else {
-        log::Message(log::Level::Debug, "tcp") << "accept ok socket=" << accepted;
+        UC_DEBUG("transport tcp accept ok socket={}", accepted);
     }
     return Status::Ok;
 }
@@ -191,8 +236,7 @@ Status TcpControlPlane::connect(const TcpEndpoint& endpoint) {
     if (endpoint.host.empty() || endpoint.port == 0) {
         return Status::InvalidArgument;
     }
-    log::Message(log::Level::Debug, "tcp") << "connect begin endpoint=" << endpoint.host
-                                           << ':' << endpoint.port;
+    UC_DEBUG("transport tcp connect begin endpoint={}:{}", endpoint.host, endpoint.port);
     close();
 
     addrinfo hints{};
@@ -202,8 +246,7 @@ Status TcpControlPlane::connect(const TcpEndpoint& endpoint) {
     addrinfo* results = nullptr;
     const auto port = std::to_string(endpoint.port);
     if (getaddrinfo(endpoint.host.c_str(), port.c_str(), &hints, &results) != 0) {
-        log::Message(log::Level::Error, "tcp") << "connect getaddrinfo failed endpoint="
-                                               << endpoint.host << ':' << endpoint.port;
+        UC_ERROR("transport tcp connect getaddrinfo failed endpoint={}:{}", endpoint.host, endpoint.port);
         return Status::Failed;
     }
 
@@ -216,9 +259,7 @@ Status TcpControlPlane::connect(const TcpEndpoint& endpoint) {
         if (::connect(candidate, item->ai_addr, static_cast<int>(item->ai_addrlen)) == 0) {
             impl_->socket = candidate;
             status = Status::Ok;
-            log::Message(log::Level::Debug, "tcp") << "connect ok endpoint=" << endpoint.host
-                                                   << ':' << endpoint.port
-                                                   << " socket=" << candidate;
+            UC_DEBUG("transport tcp connect ok endpoint={}:{} socket={}", endpoint.host, endpoint.port, candidate);
             break;
         }
         CloseSocket(candidate);
@@ -226,8 +267,7 @@ Status TcpControlPlane::connect(const TcpEndpoint& endpoint) {
 
     freeaddrinfo(results);
     if (status != Status::Ok) {
-        log::Message(log::Level::Error, "tcp") << "connect failed endpoint=" << endpoint.host
-                                               << ':' << endpoint.port;
+        UC_ERROR("transport tcp connect failed endpoint={}:{}", endpoint.host, endpoint.port);
     }
     return status;
 }
@@ -236,8 +276,7 @@ Status TcpControlPlane::sendMetadata(const Metadata& metadata) const {
     if (impl_->socket == kInvalidSocket || metadata.size() > UINT32_MAX) {
         return Status::InvalidArgument;
     }
-    log::Message(log::Level::Debug, "tcp") << "send metadata "
-                                           << log::metadataSummary(metadata);
+    UC_DEBUG("transport tcp send metadata {}", MetadataSummary(metadata));
     const uint32_t length = HostToNetwork32(static_cast<uint32_t>(metadata.size()));
     auto status = SendAll(impl_->socket, &length, sizeof(length));
     if (status != Status::Ok || metadata.empty()) {
@@ -258,14 +297,12 @@ Status TcpControlPlane::receiveMetadata(Metadata& metadata) const {
     const auto length = NetworkToHost32(network_length);
     metadata.assign(length, 0);
     if (length == 0) {
-        log::Message(log::Level::Debug, "tcp") << "receive metadata "
-                                               << log::metadataSummary(metadata);
+        UC_DEBUG("transport tcp receive metadata {}", MetadataSummary(metadata));
         return Status::Ok;
     }
     status = RecvAll(impl_->socket, metadata.data(), metadata.size());
     if (status == Status::Ok) {
-        log::Message(log::Level::Debug, "tcp") << "receive metadata "
-                                               << log::metadataSummary(metadata);
+        UC_DEBUG("transport tcp receive metadata {}", MetadataSummary(metadata));
     }
     return status;
 }
@@ -275,14 +312,13 @@ bool TcpControlPlane::connected() const {
 }
 
 void TcpControlPlane::closeConnection() {
-    log::Message(log::Level::Trace, "tcp") << "close connection socket=" << impl_->socket;
+    UC_DEBUG("transport tcp close connection socket={}", impl_->socket);
     CloseSocket(impl_->socket);
     impl_->socket = kInvalidSocket;
 }
 
 void TcpControlPlane::close() {
-    log::Message(log::Level::Trace, "tcp") << "close socket=" << impl_->socket
-                                           << " listen_socket=" << impl_->listen_socket;
+    UC_DEBUG("transport tcp close socket={} listen_socket={}", impl_->socket, impl_->listen_socket);
     CloseSocket(impl_->socket);
     CloseSocket(impl_->listen_socket);
     impl_->socket = kInvalidSocket;
