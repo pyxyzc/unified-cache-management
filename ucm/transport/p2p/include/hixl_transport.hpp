@@ -8,8 +8,9 @@
 
 namespace transport {
 
-struct HixlInitAttrs {
+struct HixlInitAttrs : public InitAttrs {
     std::string local_engine;
+    int32_t device_id = 0;
     std::map<std::string, std::string> options;
     int32_t connect_timeout_ms = 1000;
     int32_t transfer_timeout_ms = 1000;
@@ -28,13 +29,14 @@ class HixlTransport final : public Transport {
     HixlTransport& operator=(const HixlTransport&) = delete;
 
     const char* name() const override;
-    Status init() override;
+    Status init(const InitAttrs& options) override;
     Status init(const HixlInitAttrs& options);
     Status shutdown() override;
     Status registerMemory(const MemoryRegion& memory) override;
     Status unregisterMemory(const MemoryRegion& memory) override;
     Status exportMetadata(Metadata& out) const override;
     Status importMetadata(PeerID peer, const Metadata& metadata) override;
+    Status connectPeer(PeerID peer) override;
     Status submitTransfer(const Transfer& request) override;
 
    private:

@@ -17,6 +17,7 @@ enum class Opcode {
     Send,
     Read,
     Write,
+    Custom,
 };
 
 enum class Status {
@@ -39,11 +40,15 @@ struct MemoryRegion {
     int device_id = -1;
 };
 
+struct InitAttrs {
+    virtual ~InitAttrs();
+};
+
 struct Transfer {
     Opcode opcode = Opcode::Send;
-    uint64_t local_address = 0;
+    void* local_addr = nullptr;
     PeerID target_id = kInvalidPeerID;
-    uint64_t target_address = 0;
+    uint64_t remote_addr = 0;
     uint64_t length = 0;
 };
 
@@ -52,7 +57,7 @@ class Transport {
     virtual ~Transport();
 
     virtual const char* name() const = 0;
-    virtual Status init();
+    virtual Status init(const InitAttrs& options);
     virtual Status shutdown();
 
     virtual Status registerMemory(const MemoryRegion& memory);

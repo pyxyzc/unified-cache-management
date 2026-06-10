@@ -1,47 +1,132 @@
 #include "hixl_transport.hpp"
 
 #include "transport_internal.hpp"
+#include "transport_log.hpp"
 
 #include <cstring>
 #include <map>
 #include <string>
+#include <unordered_map>
 
-#if defined(TRANSPORT_ENABLE_HIXL)
+#include "acl/acl.h"
 #include "hixl/hixl.h"
-#endif
 
 namespace transport {
+namespace {
+
+std::string EngineHost(const std::string& engine) {
+    const auto delimiter = engine.rfind(':');
+    return delimiter == std::string::npos ? engine : engine.substr(0, delimiter);
+}
+
+std::string EnginePort(const std::string& engine) {
+    const auto delimiter = engine.rfind(':');
+    return delimiter == std::string::npos ? "" : engine.substr(delimiter + 1);
+}
+
+const char* MemoryTypeName(MemoryType type) {
+    return type == MemoryType::Device ? "Device" : "Host";
+}
+
+const char* OpcodeName(Opcode opcode) {
+    switch (opcode) {
+        case Opcode::Send:
+            return "Send";
+        case Opcode::Read:
+            return "Read";
+        case Opcode::Write:
+            return "Write";
+        case Opcode::Custom:
+            return "Custom";
+    }
+    return "Unknown";
+}
+
+void PrintHixlEndpointDebug(const char* step, const std::string& local_engine, int32_t device_id) {
+    log::Message(log::Level::Debug, "hixl") << step
+                                            << " local_engine=\"" << local_engine << "\""
+                                            << " host=\"" << EngineHost(local_engine) << "\""
+                                            << " port=\"" << EnginePort(local_engine) << "\""
+                                            << " device_id=" << device_id;
+}
+
+}  // namespace
 
 struct HixlTransport::Impl {
     struct Peer {
         std::string remote_engine;
+        bool connected = false;
+    };
+
+    struct LocalMemoryRecord {
+        MemoryRegion region;
+        hixl::MemHandle native_handle = nullptr;
     };
 
     std::string local_engine;
     std::map<std::string, std::string> options;
     int32_t connect_timeout_ms = 1000;
     int32_t transfer_timeout_ms = 1000;
-    detail::InMemoryRegistry registry;
+    int32_t device_id = 0;
+    bool initialized = false;
     std::unordered_map<PeerID, Peer> peers;
-
-#if defined(TRANSPORT_ENABLE_HIXL)
+    aclrtContext acl_context = nullptr;
     hixl::Hixl hixl;
-    std::unordered_map<uint64_t, hixl::MemHandle> native_handles;
-#else
-    std::unordered_map<uint64_t, void*> native_handles;
-#endif
+    std::unordered_map<uint64_t, LocalMemoryRecord> memories;
+
+    std::unordered_map<uint64_t, LocalMemoryRecord>::iterator findMemory(uint64_t address, uint64_t length);
+    Status activateAclContext();
 };
 
 HixlTransport::HixlTransport() : impl_(std::make_unique<Impl>()) {}
 
 HixlTransport::~HixlTransport() = default;
 
+std::unordered_map<uint64_t, HixlTransport::Impl::LocalMemoryRecord>::iterator HixlTransport::Impl::findMemory(
+    uint64_t address,
+    uint64_t length) {
+    for (auto it = memories.begin(); it != memories.end(); ++it) {
+        const auto begin = detail::PtrToU64(it->second.region.addr);
+        if (address < begin) {
+            continue;
+        }
+        const auto offset = address - begin;
+        if (offset <= it->second.region.length && length <= it->second.region.length - offset) {
+            return it;
+        }
+    }
+    return memories.end();
+}
+
+Status HixlTransport::Impl::activateAclContext() {
+    PrintHixlEndpointDebug("activateAclContext", local_engine, device_id);
+    if (acl_context != nullptr) {
+        const auto status = aclrtSetCurrentContext(acl_context);
+        if (status != ACL_ERROR_NONE) {
+            log::Message(log::Level::Error, "hixl")
+                << "activate ACL context failed: aclrtSetCurrentContext returned "
+                << static_cast<int>(status);
+            return Status::Failed;
+        }
+        return Status::Ok;
+    }
+    const auto status = aclrtSetDevice(device_id);
+    if (status != ACL_ERROR_NONE) {
+        log::Message(log::Level::Error, "hixl")
+            << "activate ACL context failed: aclrtSetDevice(" << device_id
+            << ") returned " << static_cast<int>(status);
+        return Status::Failed;
+    }
+    return Status::Ok;
+}
+
 const char* HixlTransport::name() const {
     return "hixl";
 }
 
-Status HixlTransport::init() {
-    return init(HixlInitAttrs{});
+Status HixlTransport::init(const InitAttrs& options) {
+    const auto* attrs = dynamic_cast<const HixlInitAttrs*>(&options);
+    return attrs == nullptr ? Status::InvalidArgument : init(*attrs);
 }
 
 Status HixlTransport::init(const HixlInitAttrs& options) {
@@ -52,75 +137,147 @@ Status HixlTransport::init(const HixlInitAttrs& options) {
     impl_->options = options.options;
     impl_->connect_timeout_ms = options.connect_timeout_ms;
     impl_->transfer_timeout_ms = options.transfer_timeout_ms;
+    impl_->device_id = options.device_id;
 
-#if defined(TRANSPORT_ENABLE_HIXL)
+    PrintHixlEndpointDebug("init begin", impl_->local_engine, impl_->device_id);
+    log::Message(log::Level::Debug, "hixl")
+        << "init timeouts connect_ms=" << impl_->connect_timeout_ms
+        << " transfer_ms=" << impl_->transfer_timeout_ms
+        << " option_count=" << impl_->options.size();
+    for (const auto& item : impl_->options) {
+        log::Message(log::Level::Debug, "hixl") << "init option " << item.first << '=' << item.second;
+    }
+
+    const auto set_device_status = aclrtSetDevice(impl_->device_id);
+    if (set_device_status != ACL_ERROR_NONE) {
+        log::Message(log::Level::Error, "hixl")
+            << "init failed: aclrtSetDevice(" << impl_->device_id << ") returned "
+            << static_cast<int>(set_device_status);
+        return Status::Failed;
+    }
     std::map<hixl::AscendString, hixl::AscendString> hixl_options;
     for (const auto& item : impl_->options) {
         hixl_options.emplace(item.first.c_str(), item.second.c_str());
     }
-    return impl_->hixl.Initialize(impl_->local_engine.c_str(), hixl_options) == hixl::SUCCESS
-               ? Status::Ok
-               : Status::Failed;
-#else
+    log::Message(log::Level::Debug, "hixl")
+        << "calling Initialize local_engine=\"" << impl_->local_engine
+        << "\" listen_port=\"" << EnginePort(impl_->local_engine)
+        << "\" device_id=" << impl_->device_id;
+    const auto init_status = impl_->hixl.Initialize(impl_->local_engine.c_str(), hixl_options);
+    if (init_status != hixl::SUCCESS) {
+        log::Message(log::Level::Error, "hixl")
+            << "init failed: Initialize(\"" << impl_->local_engine
+            << "\") returned " << static_cast<int>(init_status);
+        (void)aclrtResetDevice(impl_->device_id);
+        return Status::Failed;
+    }
+    const auto context_status = aclrtGetCurrentContext(&impl_->acl_context);
+    if (context_status != ACL_ERROR_NONE) {
+        log::Message(log::Level::Error, "hixl")
+            << "init failed: aclrtGetCurrentContext returned "
+            << static_cast<int>(context_status);
+        impl_->hixl.Finalize();
+        (void)aclrtResetDevice(impl_->device_id);
+        return Status::Failed;
+    }
+    impl_->initialized = true;
+    log::Message(log::Level::Debug, "hixl")
+        << "init ok local_engine=\"" << impl_->local_engine
+        << "\" device_id=" << impl_->device_id
+        << " acl_context=" << impl_->acl_context;
     return Status::Ok;
-#endif
 }
 
 Status HixlTransport::shutdown() {
-#if defined(TRANSPORT_ENABLE_HIXL)
-    for (const auto& item : impl_->peers) {
-        (void)impl_->hixl.Disconnect(item.second.remote_engine.c_str(), impl_->connect_timeout_ms);
+    log::Message(log::Level::Debug, "hixl")
+        << "shutdown local_engine=\"" << impl_->local_engine
+        << "\" device_id=" << impl_->device_id
+        << " peer_count=" << impl_->peers.size()
+        << " memory_count=" << impl_->memories.size();
+    if (impl_->initialized) {
+        if (impl_->activateAclContext() != Status::Ok) {
+            return Status::Failed;
+        }
+        for (const auto& item : impl_->peers) {
+            (void)impl_->hixl.Disconnect(item.second.remote_engine.c_str(), impl_->connect_timeout_ms);
+        }
+        for (const auto& item : impl_->memories) {
+            if (item.second.native_handle != nullptr) {
+                (void)impl_->hixl.DeregisterMem(item.second.native_handle);
+            }
+        }
+        impl_->hixl.Finalize();
+        (void)aclrtResetDevice(impl_->device_id);
+        impl_->initialized = false;
+        impl_->acl_context = nullptr;
     }
-    for (const auto& item : impl_->native_handles) {
-        (void)impl_->hixl.DeregisterMem(item.second);
-    }
-    impl_->hixl.Finalize();
-#endif
     impl_->peers.clear();
-    impl_->native_handles.clear();
-    impl_->registry = detail::InMemoryRegistry{};
+    impl_->memories.clear();
     return Status::Ok;
 }
 
 Status HixlTransport::registerMemory(const MemoryRegion& memory) {
-    const auto status = impl_->registry.Register(memory);
-    if (status != Status::Ok) {
-        return status;
+    if (memory.addr == nullptr || memory.length == 0) {
+        return Status::InvalidArgument;
     }
     const auto address = detail::PtrToU64(memory.addr);
+    if (impl_->memories.find(address) != impl_->memories.end()) {
+        return Status::AlreadyExists;
+    }
 
-#if defined(TRANSPORT_ENABLE_HIXL)
+    Impl::LocalMemoryRecord record;
+    record.region = memory;
+    if (impl_->activateAclContext() != Status::Ok) {
+        return Status::Failed;
+    }
+    log::Message(log::Level::Debug, "hixl")
+        << "registerMemory local_engine=\"" << impl_->local_engine
+        << "\" addr=0x" << std::hex << address << std::dec
+        << " length=" << memory.length
+        << " type=" << MemoryTypeName(memory.type)
+        << " region_device_id=" << memory.device_id
+        << " transport_device_id=" << impl_->device_id;
     hixl::MemDesc desc{};
     desc.addr = static_cast<uintptr_t>(address);
     desc.len = static_cast<size_t>(memory.length);
     hixl::MemHandle handle = nullptr;
     const auto type = memory.type == MemoryType::Device ? hixl::MEM_DEVICE : hixl::MEM_HOST;
     if (impl_->hixl.RegisterMem(desc, type, handle) != hixl::SUCCESS) {
-        (void)impl_->registry.Unregister(memory);
         return Status::Failed;
     }
-    impl_->native_handles[address] = handle;
-#endif
+    log::Message(log::Level::Debug, "hixl") << "registerMemory ok handle=" << handle;
+    record.native_handle = handle;
+    impl_->memories.emplace(address, record);
     return Status::Ok;
 }
 
 Status HixlTransport::unregisterMemory(const MemoryRegion& memory) {
     const auto address = detail::PtrToU64(memory.addr);
-#if defined(TRANSPORT_ENABLE_HIXL)
-    const auto it = impl_->native_handles.find(address);
-    if (it != impl_->native_handles.end()) {
-        if (impl_->hixl.DeregisterMem(it->second) != hixl::SUCCESS) {
+    const auto it = impl_->memories.find(address);
+    if (it == impl_->memories.end()) {
+        return Status::NotFound;
+    }
+    if (impl_->activateAclContext() != Status::Ok) {
+        return Status::Failed;
+    }
+    log::Message(log::Level::Debug, "hixl")
+        << "unregisterMemory local_engine=\"" << impl_->local_engine
+        << "\" addr=0x" << std::hex << address << std::dec
+        << " length=" << it->second.region.length
+        << " type=" << MemoryTypeName(it->second.region.type)
+        << " handle=" << it->second.native_handle;
+    if (it->second.native_handle != nullptr) {
+        if (impl_->hixl.DeregisterMem(it->second.native_handle) != hixl::SUCCESS) {
             return Status::Failed;
         }
-        impl_->native_handles.erase(it);
+        it->second.native_handle = nullptr;
     }
-#endif
-    return impl_->registry.Unregister(memory);
+    impl_->memories.erase(it);
+    return Status::Ok;
 }
 
 Status HixlTransport::exportMetadata(Metadata& out) const {
     std::map<std::string, std::string> kv;
-    kv["transport"] = name();
     kv["local_engine"] = impl_->local_engine;
     out = detail::PackKV(kv);
     return Status::Ok;
@@ -136,52 +293,91 @@ Status HixlTransport::importMetadata(PeerID peer, const Metadata& metadata) {
     Impl::Peer peer_state;
     peer_state.remote_engine = engine_it->second;
 
-#if defined(TRANSPORT_ENABLE_HIXL)
-    if (impl_->hixl.Connect(peer_state.remote_engine.c_str(), impl_->connect_timeout_ms) != hixl::SUCCESS) {
-        return Status::Failed;
-    }
-#endif
+    log::Message(log::Level::Debug, "hixl")
+        << "importMetadata peer=" << peer
+        << " remote_engine=\"" << peer_state.remote_engine << "\""
+        << " remote_host=\"" << EngineHost(peer_state.remote_engine) << "\""
+        << " remote_port=\"" << EnginePort(peer_state.remote_engine) << "\"";
     impl_->peers[peer] = std::move(peer_state);
     return Status::Ok;
 }
 
+Status HixlTransport::connectPeer(PeerID peer) {
+    const auto peer_it = impl_->peers.find(peer);
+    if (peer_it == impl_->peers.end()) {
+        return Status::NotFound;
+    }
+    auto& peer_state = peer_it->second;
+    if (peer_state.connected) {
+        return Status::Ok;
+    }
+    if (impl_->activateAclContext() != Status::Ok) {
+        return Status::Failed;
+    }
+    log::Message(log::Level::Debug, "hixl")
+        << "connectPeer peer=" << peer
+        << " local_engine=\"" << impl_->local_engine << "\""
+        << " remote_engine=\"" << peer_state.remote_engine << "\""
+        << " remote_port=\"" << EnginePort(peer_state.remote_engine) << "\""
+        << " timeout_ms=" << impl_->connect_timeout_ms;
+    const auto connect_status = impl_->hixl.Connect(peer_state.remote_engine.c_str(), impl_->connect_timeout_ms);
+    if (connect_status != hixl::SUCCESS) {
+        log::Message(log::Level::Error, "hixl")
+            << "connect failed: Connect(\"" << peer_state.remote_engine
+            << "\") returned " << static_cast<int>(connect_status);
+        return Status::Failed;
+    }
+    peer_state.connected = true;
+    return Status::Ok;
+}
+
 Status HixlTransport::submitTransfer(const Transfer& request) {
-    if (request.opcode == Opcode::Send) {
+    if (request.opcode != Opcode::Read && request.opcode != Opcode::Write) {
         return Status::InvalidArgument;
     }
-    const auto* local = impl_->registry.Find(request.local_address, request.length);
-    if (local == nullptr || local->addr == nullptr || request.length == 0) {
+    const auto local_address = detail::PtrToU64(request.local_addr);
+    const auto local_it = impl_->findMemory(local_address, request.length);
+    if (local_it == impl_->memories.end() || request.length == 0) {
         return Status::InvalidArgument;
     }
     const auto peer_it = impl_->peers.find(request.target_id);
     if (peer_it == impl_->peers.end()) {
         return Status::NotFound;
     }
+    if (!peer_it->second.connected) {
+        return Status::InvalidArgument;
+    }
 
-#if defined(TRANSPORT_ENABLE_HIXL)
+    if (impl_->activateAclContext() != Status::Ok) {
+        return Status::Failed;
+    }
+    if (request.remote_addr == 0) {
+        return Status::InvalidArgument;
+    }
     hixl::TransferOpDesc desc{
-        static_cast<uintptr_t>(request.local_address),
-        static_cast<uintptr_t>(request.target_address),
+        static_cast<uintptr_t>(local_address),
+        static_cast<uintptr_t>(request.remote_addr),
         static_cast<size_t>(request.length),
     };
     const auto op = request.opcode == Opcode::Read ? hixl::READ : hixl::WRITE;
-    return impl_->hixl.TransferSync(peer_it->second.remote_engine.c_str(), op, {desc},
-                                    impl_->transfer_timeout_ms) == hixl::SUCCESS
-               ? Status::Ok
-               : Status::Failed;
-#else
-    (void)peer_it;
-    if (request.opcode == Opcode::Read) {
-        std::memcpy(detail::U64ToPtr(request.local_address),
-                    detail::U64ToPtr(request.target_address),
-                    static_cast<size_t>(request.length));
-    } else {
-        std::memcpy(detail::U64ToPtr(request.target_address),
-                    detail::U64ToPtr(request.local_address),
-                    static_cast<size_t>(request.length));
+    log::Message(log::Level::Debug, "hixl")
+        << "submitTransfer opcode=" << OpcodeName(request.opcode)
+        << " peer=" << request.target_id
+        << " remote_engine=\"" << peer_it->second.remote_engine << "\""
+        << " local_addr=0x" << std::hex << local_address
+        << " remote_addr=0x" << request.remote_addr << std::dec
+        << " length=" << request.length
+        << " timeout_ms=" << impl_->transfer_timeout_ms;
+    const auto transfer_status = impl_->hixl.TransferSync(peer_it->second.remote_engine.c_str(), op, {desc},
+                                                          impl_->transfer_timeout_ms);
+    if (transfer_status != hixl::SUCCESS) {
+        log::Message(log::Level::Error, "hixl")
+            << "transfer failed: TransferSync(\"" << peer_it->second.remote_engine
+            << "\", " << OpcodeName(request.opcode) << ") returned "
+            << static_cast<int>(transfer_status);
+        return Status::Failed;
     }
     return Status::Ok;
-#endif
 }
 
 }  // namespace transport

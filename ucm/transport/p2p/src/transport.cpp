@@ -2,9 +2,11 @@
 
 namespace transport {
 
+InitAttrs::~InitAttrs() = default;
 Transport::~Transport() = default;
 
-Status Transport::init() {
+Status Transport::init(const InitAttrs& options) {
+    (void)options;
     return Status::Ok;
 }
 

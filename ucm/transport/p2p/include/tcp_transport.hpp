@@ -20,9 +20,11 @@ class TcpControlPlane {
 
     TcpControlPlane(const TcpControlPlane&) = delete;
     TcpControlPlane& operator=(const TcpControlPlane&) = delete;
+    TcpControlPlane(TcpControlPlane&&) noexcept;
+    TcpControlPlane& operator=(TcpControlPlane&&) noexcept;
 
     Status listen(const TcpEndpoint& endpoint, int backlog = 16);
-    Status accept();
+    Status accept(TcpControlPlane& channel, TcpEndpoint* remote = nullptr);
     Status connect(const TcpEndpoint& endpoint);
     Status sendMetadata(const Metadata& metadata) const;
     Status receiveMetadata(Metadata& metadata) const;

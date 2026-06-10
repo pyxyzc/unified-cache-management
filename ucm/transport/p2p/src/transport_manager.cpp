@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -20,38 +22,103 @@ TransportManager::~TransportManager() {
     (void)shutdown();
 }
 
-Status TransportManager::installTransport(TransportPtr transport) {
-    if (!transport || transport->name() == nullptr || std::string(transport->name()).empty()) {
+Status TransportManager::installTransport(const std::string& protocol, const InitAttrs& options) {
+    if (protocol_map_.find(protocol) != protocol_map_.end()) {
+        return Status::AlreadyExists;
+    }
+
+    TransportPtr transport;
+    if (protocol == "hixl") {
+        transport = std::make_shared<HixlTransport>();
+    } else if (protocol == "rdma") {
+        transport = std::make_shared<RdmaTransport>();
+    } else {
         return Status::InvalidArgument;
     }
 
-    const auto protocol = std::string(transport->name());
+    const auto status = transport->init(options);
+    if (status != Status::Ok) {
+        return status;
+    }
+
+    return installInitializedTransport(protocol, std::move(transport));
+}
+
+Status TransportManager::installInitializedTransport(const std::string& protocol, TransportPtr transport) {
+    if (protocol.empty() || !transport) {
+        return Status::InvalidArgument;
+    }
     if (protocol_map_.find(protocol) != protocol_map_.end()) {
         return Status::AlreadyExists;
     }
 
     protocol_map_[protocol] = transport.get();
-    transports_.push_back(std::move(transport));
+    transports_.push_back(InstalledTransport{protocol, std::move(transport)});
     return Status::Ok;
 }
 
-Status TransportManager::createChannel(const TcpEndpoint& endpoint, PeerID& peer) {
+Status TransportManager::createChannel(const std::vector<TcpEndpoint>& endpoints, std::vector<PeerID>& peers) {
+    peers.assign(endpoints.size(), kInvalidPeerID);
+    std::vector<Status> statuses(endpoints.size(), Status::Ok);
+    std::vector<std::thread> workers;
+    workers.reserve(endpoints.size());
+
+    for (size_t i = 0; i < endpoints.size(); ++i) {
+        workers.emplace_back([this, &endpoints, &peers, &statuses, i]() {
+            statuses[i] = createSingleChannel(endpoints[i], peers[i]);
+        });
+    }
+
+    for (auto& worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    for (const auto status : statuses) {
+        if (status != Status::Ok) {
+            return status;
+        }
+    }
+    return Status::Ok;
+}
+
+Status TransportManager::createSingleChannel(const TcpEndpoint& endpoint, PeerID& peer) {
     peer = kInvalidPeerID;
     const auto endpoint_key = endpointKey(endpoint);
-    const auto existing = peers_by_endpoint_.find(endpoint_key);
-    if (existing != peers_by_endpoint_.end() && peerConnected(existing->second)) {
-        peer = existing->second;
+    if (endpoint_key == endpointKey(config_.endpoint)) {
         return Status::Ok;
     }
 
-    TcpControlPlane channel;
-    auto status = channel.connect(endpoint);
-    if (status != Status::Ok) {
-        return status;
+    {
+        std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
+        const auto existing = peers_by_endpoint_.find(endpoint_key);
+        if (existing != peers_by_endpoint_.end() && peerConnected(existing->second)) {
+            peer = existing->second;
+            return Status::Ok;
+        }
     }
 
+    TcpControlPlane channel;
+
+    if (endpointKey(config_.endpoint) < endpoint_key) {
+        const auto status = channel.connect(endpoint);
+        if (status != Status::Ok) {
+            return status;
+        }
+    } else {
+        const auto status = waitAcceptedChannel(endpoint, channel);
+        if (status != Status::Ok) {
+            return status;
+        }
+    }
+
+    return runChannelHandshake(channel, peer);
+}
+
+Status TransportManager::runChannelHandshake(TcpControlPlane& channel, PeerID& peer) {
     Metadata local;
-    status = exportInstalledMetadata(local);
+    auto status = exportInstalledMetadata(local);
     if (status != Status::Ok) {
         channel.closeConnection();
         return status;
@@ -70,13 +137,33 @@ Status TransportManager::createChannel(const TcpEndpoint& endpoint, PeerID& peer
         return status;
     }
 
-    status = onPeerMetadataReceived(remote, peer);
+    status = establishPeerFromMetadata(remote, peer);
     if (status != Status::Ok) {
         channel.closeConnection();
         return status;
     }
 
     channel.closeConnection();
+    return Status::Ok;
+}
+
+Status TransportManager::waitAcceptedChannel(const TcpEndpoint& endpoint, TcpControlPlane& channel) {
+    std::unique_lock<std::mutex> lock(accepted_mutex_);
+    const auto ready = [this, &endpoint]() {
+        const auto it = accepted_channels_by_host_.find(endpoint.host);
+        return it != accepted_channels_by_host_.end() && !it->second.empty();
+    };
+
+    if (!accepted_cv_.wait_for(lock, std::chrono::seconds(30), ready)) {
+        return Status::Failed;
+    }
+
+    auto& queue = accepted_channels_by_host_[endpoint.host];
+    channel = std::move(queue.front());
+    queue.pop_front();
+    if (queue.empty()) {
+        accepted_channels_by_host_.erase(endpoint.host);
+    }
     return Status::Ok;
 }
 
@@ -107,32 +194,19 @@ void TransportManager::stopChannelListener() {
 }
 
 Status TransportManager::handleAcceptedChannel() {
-    auto status = control_.accept();
+    TcpControlPlane channel;
+    TcpEndpoint remote;
+    auto status = control_.accept(channel, &remote);
     if (status != Status::Ok) {
         return status;
     }
 
-    Metadata remote;
-    status = control_.receiveMetadata(remote);
-    if (status != Status::Ok) {
-        control_.closeConnection();
-        return status;
+    {
+        std::lock_guard<std::mutex> lock(accepted_mutex_);
+        accepted_channels_by_host_[remote.host].push_back(std::move(channel));
     }
-
-    PeerID peer = kInvalidPeerID;
-    status = onPeerMetadataReceived(remote, peer);
-    if (status != Status::Ok) {
-        control_.closeConnection();
-        return status;
-    }
-
-    Metadata local;
-    status = exportInstalledMetadata(local);
-    if (status == Status::Ok) {
-        status = control_.sendMetadata(local);
-    }
-    control_.closeConnection();
-    return status;
+    accepted_cv_.notify_all();
+    return Status::Ok;
 }
 
 Status TransportManager::shutdown() {
@@ -140,12 +214,16 @@ Status TransportManager::shutdown() {
 
     Status result = Status::Ok;
     for (auto& item : transports_) {
-        const auto status = item->shutdown();
+        const auto status = item.transport->shutdown();
         if (status != Status::Ok && result == Status::Ok) {
             result = status;
         }
     }
     control_.close();
+    {
+        std::lock_guard<std::mutex> lock(accepted_mutex_);
+        accepted_channels_by_host_.clear();
+    }
     peer_states_.clear();
     peers_by_endpoint_.clear();
     protocol_map_.clear();
@@ -166,9 +244,9 @@ Status TransportManager::unregisterMemory(const std::string& transport_name, con
     return it == protocol_map_.end() ? Status::NotFound : it->second->unregisterMemory(memory);
 }
 
-Status TransportManager::submitTransfer(const std::string& transport_name, const Transfer& transfer) {
-    const auto it = protocol_map_.find(transport_name);
-    return it == protocol_map_.end() ? Status::NotFound : it->second->submitTransfer(transfer);
+Status TransportManager::submitTransfer(TransferType type, const Transfer& transfer) {
+    auto* transport = selectTransport(type, transfer.opcode);
+    return transport == nullptr ? Status::NotFound : transport->submitTransfer(transfer);
 }
 
 Status TransportManager::exportInstalledMetadata(Metadata& out) const {
@@ -183,20 +261,21 @@ Status TransportManager::exportInstalledMetadata(Metadata& out) const {
         return Status::InvalidArgument;
     }
 
-    for (const auto& transport : transports_) {
+    for (const auto& item : transports_) {
         Metadata metadata;
-        const auto status = transport->exportMetadata(metadata);
+        const auto status = item.transport->exportMetadata(metadata);
         if (status != Status::Ok) {
             return status;
         }
-        if (!appendMetadataRecord(out, transport->name(), metadata)) {
+        if (!appendMetadataRecord(out, item.protocol, metadata)) {
             return Status::InvalidArgument;
         }
     }
     return Status::Ok;
 }
 
-Status TransportManager::onPeerMetadataReceived(const Metadata& metadata, PeerID& peer) {
+Status TransportManager::establishPeerFromMetadata(const Metadata& metadata, PeerID& peer) {
+    std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
     peer = kInvalidPeerID;
     if (metadata.size() < sizeof(uint32_t)) {
         return Status::InvalidArgument;
@@ -275,8 +354,8 @@ Status TransportManager::onPeerMetadataReceived(const Metadata& metadata, PeerID
 }
 
 Status TransportManager::establishDataPlane(PeerID peer) {
-    for (const auto& transport : transports_) {
-        const auto status = transport->connectPeer(peer);
+    for (const auto& item : transports_) {
+        const auto status = item.transport->connectPeer(peer);
         if (status != Status::Ok) {
             return status;
         }
@@ -284,7 +363,31 @@ Status TransportManager::establishDataPlane(PeerID peer) {
     return Status::Ok;
 }
 
+Transport* TransportManager::selectTransport(TransferType type, Opcode opcode) const {
+    const char* protocol = nullptr;
+    switch (type) {
+        case TransferType::D2D:
+        case TransferType::RD2D:
+            return nullptr;
+        case TransferType::D2H:
+        case TransferType::RD2H:
+            if (opcode == Opcode::Send) {
+                protocol = "rdma";
+            } else if (opcode == Opcode::Read || opcode == Opcode::Write) {
+                protocol = "hixl";
+            }
+            break;
+    }
+
+    if (protocol == nullptr) {
+        return nullptr;
+    }
+    const auto it = protocol_map_.find(protocol);
+    return it == protocol_map_.end() ? nullptr : it->second;
+}
+
 bool TransportManager::peerConnected(PeerID peer) const {
+    std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
     const auto it = peer_states_.find(peer);
     return it != peer_states_.end() && it->second.metadata_imported && it->second.data_connected;
 }

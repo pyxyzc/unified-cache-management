@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -16,19 +17,13 @@
 #include <utility>
 #include <vector>
 
-#if defined(TRANSPORT_ENABLE_RDMA)
 #include <infiniband/verbs.h>
-#endif
 
 namespace transport {
 namespace {
 
 constexpr int kDefaultRdmaAccess =
-#if defined(TRANSPORT_ENABLE_RDMA)
     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-#else
-    0;
-#endif
 
 constexpr uint8_t kDefaultRdmaSl = 0;
 constexpr uint8_t kDefaultRdmaSrcPathBits = 0;
@@ -38,8 +33,99 @@ constexpr uint8_t kDefaultRdmaRetryCount = 7;
 constexpr uint8_t kDefaultRdmaRnrRetry = 7;
 constexpr uint8_t kDefaultRdmaMaxDestReadAtomic = 1;
 constexpr uint8_t kDefaultRdmaMaxReadAtomic = 1;
+constexpr uint32_t kRdmaMetadataMagic = 0x414d4452;  // "RDMA" in little-endian byte order.
+constexpr uint32_t kRdmaMetadataVersion = 1;
 
-#if defined(TRANSPORT_ENABLE_RDMA)
+bool FitsU32(size_t value) {
+    return value <= UINT32_MAX;
+}
+
+bool AppendU8(Metadata& out, uint8_t value) {
+    out.push_back(value);
+    return true;
+}
+
+bool AppendU16(Metadata& out, uint16_t value) {
+    out.push_back(static_cast<uint8_t>(value & 0xffU));
+    out.push_back(static_cast<uint8_t>((value >> 8U) & 0xffU));
+    return true;
+}
+
+bool AppendU32(Metadata& out, uint32_t value) {
+    for (size_t shift = 0; shift < 32; shift += 8) {
+        out.push_back(static_cast<uint8_t>((value >> shift) & 0xffU));
+    }
+    return true;
+}
+
+bool AppendU64(Metadata& out, uint64_t value) {
+    for (size_t shift = 0; shift < 64; shift += 8) {
+        out.push_back(static_cast<uint8_t>((value >> shift) & 0xffU));
+    }
+    return true;
+}
+
+bool AppendString(Metadata& out, const std::string& value) {
+    if (!FitsU32(value.size())) {
+        return false;
+    }
+    AppendU32(out, static_cast<uint32_t>(value.size()));
+    out.insert(out.end(), value.begin(), value.end());
+    return true;
+}
+
+bool ReadU8(const Metadata& input, size_t& offset, uint8_t& value) {
+    if (offset >= input.size()) {
+        return false;
+    }
+    value = input[offset++];
+    return true;
+}
+
+bool ReadU16(const Metadata& input, size_t& offset, uint16_t& value) {
+    if (input.size() - offset < 2) {
+        return false;
+    }
+    value = static_cast<uint16_t>(input[offset]) |
+            static_cast<uint16_t>(static_cast<uint16_t>(input[offset + 1]) << 8U);
+    offset += 2;
+    return true;
+}
+
+bool ReadU32(const Metadata& input, size_t& offset, uint32_t& value) {
+    if (input.size() - offset < 4) {
+        return false;
+    }
+    value = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        value |= static_cast<uint32_t>(input[offset + i]) << (i * 8);
+    }
+    offset += 4;
+    return true;
+}
+
+bool ReadU64(const Metadata& input, size_t& offset, uint64_t& value) {
+    if (input.size() - offset < 8) {
+        return false;
+    }
+    value = 0;
+    for (size_t i = 0; i < 8; ++i) {
+        value |= static_cast<uint64_t>(input[offset + i]) << (i * 8);
+    }
+    offset += 8;
+    return true;
+}
+
+bool ReadString(const Metadata& input, size_t& offset, std::string& value) {
+    uint32_t length = 0;
+    if (!ReadU32(input, offset, length) || input.size() - offset < length) {
+        return false;
+    }
+    value.assign(reinterpret_cast<const char*>(input.data() + offset), length);
+    offset += length;
+    return true;
+}
+
 std::string GidToString(const ibv_gid& gid) {
     std::ostringstream os;
     os << std::hex << std::setfill('0');
@@ -72,11 +158,114 @@ bool ParseGid(const std::string& text, ibv_gid& gid) {
     }
     return true;
 }
-#endif
 
 }  // namespace
 
-RdmaTransport::RdmaTransport() : rng_(std::random_device{}()) {}
+struct RdmaTransport::Impl {
+    struct LocalReceiveBuffer {
+        std::vector<uint8_t> buffer;
+        void* memory_region = nullptr;
+        uint32_t lkey = 0;
+    };
+
+    struct LocalQueuePair {
+        uint8_t port = 0;
+        uint16_t lid = 0;
+        std::string gid;
+        uint32_t qp_num = 0;
+        uint32_t psn = 0;
+        PeerID connected_peer = kInvalidPeerID;
+        void* completion_queue = nullptr;
+        void* queue_pair = nullptr;
+        std::vector<LocalReceiveBuffer> receive_pool;
+    };
+
+    struct LocalDevice {
+        std::string name;
+        uint8_t port_count = 0;
+        void* context = nullptr;
+        void* protection_domain = nullptr;
+        std::vector<LocalQueuePair> queue_pairs;
+    };
+
+    struct LocalMemoryRecord {
+        MemoryRegion region;
+        std::vector<void*> native_handles;
+        std::vector<RdmaMemoryAttrs> attrs;
+    };
+
+    struct PeerMemoryRegistration {
+        RdmaMemoryAttrs attrs;
+    };
+
+    struct PeerMemoryRecord {
+        uint64_t remote_address = 0;
+        uint64_t length = 0;
+        std::vector<PeerMemoryRegistration> registrations;
+    };
+
+    struct PeerState {
+        RdmaPeerAttrs attrs;
+        std::vector<RdmaPeerDeviceAttrs> devices;
+        std::unordered_map<MemoryHandle, PeerMemoryRecord> memories;
+        bool connected = false;
+    };
+
+    struct PeerMemoryLookup {
+        MemoryHandle handle = kInvalidMemoryHandle;
+        const PeerMemoryRecord* record = nullptr;
+    };
+
+    struct TransferPlan {
+        size_t device_index = 0;
+        size_t qp_index = 0;
+        MemoryHandle remote_memory = kInvalidMemoryHandle;
+    };
+
+    Status init(const RdmaInitAttrs& options);
+    Status shutdown();
+    Status registerMemory(const MemoryRegion& memory);
+    Status unregisterMemory(const MemoryRegion& memory);
+    Status exportMetadata(Metadata& out) const;
+    Status importMetadata(PeerID peer, const Metadata& metadata);
+    Status connectPeer(PeerID peer);
+    Status submitTransfer(const Transfer& transfer);
+    const RdmaPeerAttrs* peer(PeerID id) const;
+
+    Status discoverLocalDevices();
+    Status initQueuePairs(LocalDevice& device, size_t device_index);
+    Status connectQueuePair(LocalQueuePair& local_qp, const RdmaPeerQueuePair& peer_qp, PeerID peer);
+    Status initReceivePool(LocalDevice& device, LocalQueuePair& qp);
+    Status postReceive(LocalQueuePair& qp, LocalReceiveBuffer& buffer);
+    Status pollCompletion(LocalQueuePair& qp, uint64_t expected_wr_id);
+    Status submitTransferOnQueuePair(LocalQueuePair& qp,
+                                     const LocalMemoryRecord& local_memory,
+                                     const RdmaMemoryAttrs& local_attrs,
+                                     const RdmaMemoryAttrs& remote_attrs,
+                                     const Transfer& transfer);
+    Status selectTopology(const LocalMemoryRecord& local_memory,
+                          const PeerState& peer,
+                          const PeerMemoryLookup* remote_memory,
+                          const Transfer& transfer,
+                          TransferPlan& plan);
+    Status selectQueuePair(const PeerState& peer, PeerID peer_id, size_t device_index, size_t& qp_index);
+    std::unordered_map<MemoryHandle, LocalMemoryRecord>::iterator findLocalMemory(uint64_t address, uint64_t length);
+    PeerMemoryLookup findPeerMemory(PeerID peer, uint64_t address) const;
+    size_t randomIndex(size_t count);
+    uint64_t allocateWrID();
+    void cleanupDevices();
+
+    RdmaInitAttrs local_;
+    std::map<std::string, std::string> topology_;
+    std::vector<LocalDevice> devices_;
+    MemoryHandle next_memory_handle_ = 1;
+    std::unordered_map<MemoryHandle, LocalMemoryRecord> memories_;
+    std::unordered_map<PeerID, PeerState> peers_;
+    std::mt19937 rng_{std::random_device{}()};
+    std::atomic<uint64_t> next_wr_id_{1};
+};
+
+RdmaTransport::RdmaTransport() : impl_(std::make_unique<Impl>()) {}
 
 RdmaTransport::~RdmaTransport() {
     (void)shutdown();
@@ -86,23 +275,30 @@ const char* RdmaTransport::name() const {
     return "rdma";
 }
 
-Status RdmaTransport::init() {
-    return init(RdmaInitAttrs{});
+Status RdmaTransport::init(const InitAttrs& options) {
+    const auto* attrs = dynamic_cast<const RdmaInitAttrs*>(&options);
+    return attrs == nullptr ? Status::InvalidArgument : init(*attrs);
 }
 
 Status RdmaTransport::init(const RdmaInitAttrs& options) {
+    return impl_->init(options);
+}
+
+Status RdmaTransport::Impl::init(const RdmaInitAttrs& options) {
     local_ = options;
     return discoverLocalDevices();
 }
 
 Status RdmaTransport::shutdown() {
+    return impl_->shutdown();
+}
+
+Status RdmaTransport::Impl::shutdown() {
     for (auto& item : memories_) {
         for (auto& native_handle : item.second.native_handles) {
-#if defined(TRANSPORT_ENABLE_RDMA)
             if (native_handle != nullptr) {
                 (void)ibv_dereg_mr(static_cast<ibv_mr*>(native_handle));
             }
-#endif
             native_handle = nullptr;
         }
     }
@@ -116,6 +312,10 @@ Status RdmaTransport::shutdown() {
 }
 
 Status RdmaTransport::registerMemory(const MemoryRegion& memory) {
+    return impl_->registerMemory(memory);
+}
+
+Status RdmaTransport::Impl::registerMemory(const MemoryRegion& memory) {
     if (memory.addr == nullptr || memory.length == 0) {
         return Status::InvalidArgument;
     }
@@ -137,7 +337,6 @@ Status RdmaTransport::registerMemory(const MemoryRegion& memory) {
 
         RdmaMemoryAttrs attrs;
         void* native_handle = nullptr;
-#if defined(TRANSPORT_ENABLE_RDMA)
         auto* pd = static_cast<ibv_pd*>(device.protection_domain);
         auto* mr = ibv_reg_mr(pd, memory.addr, static_cast<size_t>(memory.length), kDefaultRdmaAccess);
         if (mr == nullptr) {
@@ -151,7 +350,6 @@ Status RdmaTransport::registerMemory(const MemoryRegion& memory) {
         native_handle = mr;
         attrs.lkey = mr->lkey;
         attrs.rkey = mr->rkey;
-#endif
         record.native_handles.push_back(native_handle);
         record.attrs.push_back(attrs);
     }
@@ -162,6 +360,10 @@ Status RdmaTransport::registerMemory(const MemoryRegion& memory) {
 }
 
 Status RdmaTransport::unregisterMemory(const MemoryRegion& memory) {
+    return impl_->unregisterMemory(memory);
+}
+
+Status RdmaTransport::Impl::unregisterMemory(const MemoryRegion& memory) {
     auto it = memories_.end();
     const auto address = detail::PtrToU64(memory.addr);
     for (auto candidate = memories_.begin(); candidate != memories_.end(); ++candidate) {
@@ -174,146 +376,184 @@ Status RdmaTransport::unregisterMemory(const MemoryRegion& memory) {
     if (it == memories_.end()) {
         return Status::NotFound;
     }
-#if defined(TRANSPORT_ENABLE_RDMA)
     for (auto& native_handle : it->second.native_handles) {
         if (native_handle != nullptr && ibv_dereg_mr(static_cast<ibv_mr*>(native_handle)) != 0) {
             return Status::Failed;
         }
         native_handle = nullptr;
     }
-#endif
     memories_.erase(it);
     return Status::Ok;
 }
 
 Status RdmaTransport::exportMetadata(Metadata& out) const {
-    std::map<std::string, std::string> kv;
-    kv["transport"] = name();
-    kv["gid"] = local_.gid;
-    kv["ip"] = local_.ip;
-    kv["port"] = std::to_string(local_.port);
-    kv["qp_num"] = std::to_string(local_.qp_num);
-    kv["psn"] = std::to_string(local_.psn);
-    kv["rkey"] = std::to_string(local_.rkey);
-    kv["vaddr"] = std::to_string(local_.vaddr);
-    kv["recv_depth"] = std::to_string(local_.recv_depth);
-    kv["recv_buffer_size"] = std::to_string(local_.recv_buffer_size);
-    kv["device_count"] = std::to_string(devices_.size());
-    kv["memory_count"] = std::to_string(memories_.size());
+    return impl_->exportMetadata(out);
+}
+
+Status RdmaTransport::Impl::exportMetadata(Metadata& out) const {
+    if (!FitsU32(devices_.size()) || !FitsU32(memories_.size())) {
+        return Status::InvalidArgument;
+    }
+
+    Metadata encoded;
+    AppendU32(encoded, kRdmaMetadataMagic);
+    AppendU32(encoded, kRdmaMetadataVersion);
+    if (!AppendString(encoded, local_.gid) || !AppendString(encoded, local_.ip)) {
+        return Status::InvalidArgument;
+    }
+    AppendU16(encoded, local_.port);
+    AppendU32(encoded, local_.qp_num);
+    AppendU32(encoded, local_.psn);
+    AppendU32(encoded, local_.rkey);
+    AppendU64(encoded, local_.vaddr);
+    AppendU32(encoded, local_.recv_depth);
+    AppendU32(encoded, local_.recv_buffer_size);
+    AppendU32(encoded, static_cast<uint32_t>(devices_.size()));
 
     for (size_t device_index = 0; device_index < devices_.size(); ++device_index) {
-        const auto prefix = "device." + std::to_string(device_index) + ".";
         const auto& device = devices_[device_index];
-        kv[prefix + "name"] = device.name;
-        kv[prefix + "port_count"] = std::to_string(device.port_count);
-        kv[prefix + "qp_count"] = std::to_string(device.queue_pairs.size());
+        if (!FitsU32(device.queue_pairs.size()) || !AppendString(encoded, device.name)) {
+            return Status::InvalidArgument;
+        }
+        AppendU8(encoded, device.port_count);
+        AppendU32(encoded, static_cast<uint32_t>(device.queue_pairs.size()));
         for (size_t qp_index = 0; qp_index < device.queue_pairs.size(); ++qp_index) {
-            const auto qp_prefix = prefix + "qp." + std::to_string(qp_index) + ".";
             const auto& qp = device.queue_pairs[qp_index];
-            kv[qp_prefix + "port"] = std::to_string(qp.port);
-            kv[qp_prefix + "lid"] = std::to_string(qp.lid);
-            kv[qp_prefix + "gid"] = qp.gid;
-            kv[qp_prefix + "qp_num"] = std::to_string(qp.qp_num);
-            kv[qp_prefix + "psn"] = std::to_string(qp.psn);
+            AppendU8(encoded, qp.port);
+            AppendU16(encoded, qp.lid);
+            if (!AppendString(encoded, qp.gid)) {
+                return Status::InvalidArgument;
+            }
+            AppendU32(encoded, qp.qp_num);
+            AppendU32(encoded, qp.psn);
         }
     }
 
-    size_t index = 0;
+    AppendU32(encoded, static_cast<uint32_t>(memories_.size()));
     for (const auto& item : memories_) {
-        const auto prefix = "memory." + std::to_string(index) + ".";
-        kv[prefix + "handle"] = std::to_string(item.first);
-        kv[prefix + "addr"] = std::to_string(detail::PtrToU64(item.second.region.addr));
-        kv[prefix + "length"] = std::to_string(item.second.region.length);
-        kv[prefix + "registration_count"] = std::to_string(item.second.attrs.size());
-        for (size_t reg_index = 0; reg_index < item.second.attrs.size(); ++reg_index) {
-            const auto reg_prefix = prefix + "registration." + std::to_string(reg_index) + ".";
-            const auto& attrs = item.second.attrs[reg_index];
-            kv[reg_prefix + "lkey"] = std::to_string(attrs.lkey);
-            kv[reg_prefix + "rkey"] = std::to_string(attrs.rkey);
+        if (!FitsU32(item.second.attrs.size())) {
+            return Status::InvalidArgument;
         }
-        ++index;
+        AppendU64(encoded, item.first);
+        AppendU64(encoded, detail::PtrToU64(item.second.region.addr));
+        AppendU64(encoded, item.second.region.length);
+        AppendU32(encoded, static_cast<uint32_t>(item.second.attrs.size()));
+        for (size_t reg_index = 0; reg_index < item.second.attrs.size(); ++reg_index) {
+            const auto& attrs = item.second.attrs[reg_index];
+            AppendU32(encoded, attrs.lkey);
+            AppendU32(encoded, attrs.rkey);
+        }
     }
-    out = detail::PackKV(kv);
+    out = std::move(encoded);
     return Status::Ok;
 }
 
 Status RdmaTransport::importMetadata(PeerID peer, const Metadata& metadata) {
-    const auto kv = detail::UnpackKV(metadata);
+    return impl_->importMetadata(peer, metadata);
+}
+
+Status RdmaTransport::Impl::importMetadata(PeerID peer, const Metadata& metadata) {
     PeerState state;
-
-    const auto gid_it = kv.find("gid");
-    const auto ip_it = kv.find("ip");
-    if (gid_it != kv.end()) {
-        state.attrs.gid = gid_it->second;
+    size_t offset = 0;
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    if (!ReadU32(metadata, offset, magic) || !ReadU32(metadata, offset, version) ||
+        magic != kRdmaMetadataMagic || version != kRdmaMetadataVersion) {
+        return Status::InvalidArgument;
     }
-    if (ip_it != kv.end()) {
-        state.attrs.ip = ip_it->second;
-    }
-    state.attrs.port = static_cast<uint16_t>(detail::ToU64(kv, "port"));
-    state.attrs.qp_num = static_cast<uint32_t>(detail::ToU64(kv, "qp_num"));
-    state.attrs.psn = static_cast<uint32_t>(detail::ToU64(kv, "psn"));
-    state.attrs.rkey = static_cast<uint32_t>(detail::ToU64(kv, "rkey"));
-    state.attrs.vaddr = detail::ToU64(kv, "vaddr");
 
-    const auto device_count = detail::ToU64(kv, "device_count");
-    state.devices.reserve(static_cast<size_t>(device_count));
-    for (uint64_t device_index = 0; device_index < device_count; ++device_index) {
-        const auto prefix = "device." + std::to_string(device_index) + ".";
+    uint32_t recv_depth = 0;
+    uint32_t recv_buffer_size = 0;
+    uint32_t device_count = 0;
+    if (!ReadString(metadata, offset, state.attrs.gid) ||
+        !ReadString(metadata, offset, state.attrs.ip) ||
+        !ReadU16(metadata, offset, state.attrs.port) ||
+        !ReadU32(metadata, offset, state.attrs.qp_num) ||
+        !ReadU32(metadata, offset, state.attrs.psn) ||
+        !ReadU32(metadata, offset, state.attrs.rkey) ||
+        !ReadU64(metadata, offset, state.attrs.vaddr) ||
+        !ReadU32(metadata, offset, recv_depth) ||
+        !ReadU32(metadata, offset, recv_buffer_size) ||
+        !ReadU32(metadata, offset, device_count)) {
+        return Status::InvalidArgument;
+    }
+
+    state.devices.reserve(device_count);
+    for (uint32_t device_index = 0; device_index < device_count; ++device_index) {
         RdmaPeerDeviceAttrs device;
-        const auto name_it = kv.find(prefix + "name");
-        if (name_it != kv.end()) {
-            device.name = name_it->second;
+        uint32_t qp_count = 0;
+        if (!ReadString(metadata, offset, device.name) ||
+            !ReadU8(metadata, offset, device.port_count) ||
+            !ReadU32(metadata, offset, qp_count)) {
+            return Status::InvalidArgument;
         }
-        device.port_count = static_cast<uint8_t>(detail::ToU64(kv, prefix + "port_count"));
 
-        const auto qp_count = detail::ToU64(kv, prefix + "qp_count");
-        device.queue_pairs.reserve(static_cast<size_t>(qp_count));
-        for (uint64_t qp_index = 0; qp_index < qp_count; ++qp_index) {
-            const auto qp_prefix = prefix + "qp." + std::to_string(qp_index) + ".";
+        device.queue_pairs.reserve(qp_count);
+        for (uint32_t qp_index = 0; qp_index < qp_count; ++qp_index) {
             RdmaPeerQueuePair qp;
-            qp.port = static_cast<uint8_t>(detail::ToU64(kv, qp_prefix + "port"));
-            qp.lid = static_cast<uint16_t>(detail::ToU64(kv, qp_prefix + "lid"));
-            const auto gid_it = kv.find(qp_prefix + "gid");
-            if (gid_it != kv.end()) {
-                qp.gid = gid_it->second;
+            if (!ReadU8(metadata, offset, qp.port) ||
+                !ReadU16(metadata, offset, qp.lid) ||
+                !ReadString(metadata, offset, qp.gid) ||
+                !ReadU32(metadata, offset, qp.qp_num) ||
+                !ReadU32(metadata, offset, qp.psn)) {
+                return Status::InvalidArgument;
             }
-            qp.qp_num = static_cast<uint32_t>(detail::ToU64(kv, qp_prefix + "qp_num"));
-            qp.psn = static_cast<uint32_t>(detail::ToU64(kv, qp_prefix + "psn"));
             device.queue_pairs.push_back(qp);
         }
         state.devices.push_back(std::move(device));
     }
 
-    const auto memory_count = detail::ToU64(kv, "memory_count");
-    for (uint64_t memory_index = 0; memory_index < memory_count; ++memory_index) {
-        const auto prefix = "memory." + std::to_string(memory_index) + ".";
-        const auto handle = detail::ToU64(kv, prefix + "handle");
+    uint32_t memory_count = 0;
+    if (!ReadU32(metadata, offset, memory_count)) {
+        return Status::InvalidArgument;
+    }
+    for (uint32_t memory_index = 0; memory_index < memory_count; ++memory_index) {
+        uint64_t handle = kInvalidMemoryHandle;
+        if (!ReadU64(metadata, offset, handle)) {
+            return Status::InvalidArgument;
+        }
         if (handle == kInvalidMemoryHandle) {
-            continue;
+            return Status::InvalidArgument;
         }
 
         PeerMemoryRecord memory;
-        memory.remote_address = detail::ToU64(kv, prefix + "addr");
-        memory.length = detail::ToU64(kv, prefix + "length");
+        uint32_t registration_count = 0;
+        if (!ReadU64(metadata, offset, memory.remote_address) ||
+            !ReadU64(metadata, offset, memory.length) ||
+            !ReadU32(metadata, offset, registration_count)) {
+            return Status::InvalidArgument;
+        }
+        if (memory.length == 0 || registration_count != device_count) {
+            return Status::InvalidArgument;
+        }
 
-        const auto registration_count = detail::ToU64(kv, prefix + "registration_count");
-        memory.registrations.reserve(static_cast<size_t>(registration_count));
-        for (uint64_t reg_index = 0; reg_index < registration_count; ++reg_index) {
-            const auto reg_prefix = prefix + "registration." + std::to_string(reg_index) + ".";
+        memory.registrations.reserve(registration_count);
+        for (uint32_t reg_index = 0; reg_index < registration_count; ++reg_index) {
             PeerMemoryRegistration registration;
-            registration.attrs.rkey = static_cast<uint32_t>(detail::ToU64(kv, reg_prefix + "rkey"));
-            registration.attrs.lkey = static_cast<uint32_t>(detail::ToU64(kv, reg_prefix + "lkey"));
+            if (!ReadU32(metadata, offset, registration.attrs.lkey) ||
+                !ReadU32(metadata, offset, registration.attrs.rkey)) {
+                return Status::InvalidArgument;
+            }
             memory.registrations.push_back(registration);
         }
 
-        state.memories.emplace(handle, std::move(memory));
+        if (!state.memories.emplace(handle, std::move(memory)).second) {
+            return Status::InvalidArgument;
+        }
     }
 
+    if (offset != metadata.size()) {
+        return Status::InvalidArgument;
+    }
     peers_[peer] = std::move(state);
     return Status::Ok;
 }
 
 Status RdmaTransport::connectPeer(PeerID peer) {
+    return impl_->connectPeer(peer);
+}
+
+Status RdmaTransport::Impl::connectPeer(PeerID peer) {
     const auto peer_it = peers_.find(peer);
     if (peer_it == peers_.end()) {
         return Status::NotFound;
@@ -357,6 +597,15 @@ Status RdmaTransport::connectPeer(PeerID peer) {
 }
 
 Status RdmaTransport::submitTransfer(const Transfer& transfer) {
+    return impl_->submitTransfer(transfer);
+}
+
+Status RdmaTransport::Impl::submitTransfer(const Transfer& transfer) {
+    if (transfer.opcode != Opcode::Send &&
+        transfer.opcode != Opcode::Read &&
+        transfer.opcode != Opcode::Write) {
+        return Status::InvalidArgument;
+    }
     if (transfer.length == 0 || transfer.length > UINT32_MAX) {
         return Status::InvalidArgument;
     }
@@ -367,7 +616,8 @@ Status RdmaTransport::submitTransfer(const Transfer& transfer) {
     if (!peer_it->second.connected) {
         return Status::InvalidArgument;
     }
-    const auto local_it = findLocalMemory(transfer.local_address, transfer.length);
+    const auto local_address = detail::PtrToU64(transfer.local_addr);
+    const auto local_it = findLocalMemory(local_address, transfer.length);
     if (local_it == memories_.end()) {
         return Status::NotFound;
     }
@@ -377,7 +627,7 @@ Status RdmaTransport::submitTransfer(const Transfer& transfer) {
 
     PeerMemoryLookup remote_memory;
     if (transfer.opcode == Opcode::Read || transfer.opcode == Opcode::Write) {
-        remote_memory = findPeerMemory(transfer.target_id, transfer.target_address);
+        remote_memory = findPeerMemory(transfer.target_id, transfer.remote_addr);
         if (remote_memory.record == nullptr) {
             return Status::NotFound;
         }
@@ -406,15 +656,18 @@ Status RdmaTransport::submitTransfer(const Transfer& transfer) {
 }
 
 const RdmaPeerAttrs* RdmaTransport::peer(PeerID id) const {
+    return impl_->peer(id);
+}
+
+const RdmaPeerAttrs* RdmaTransport::Impl::peer(PeerID id) const {
     const auto it = peers_.find(id);
     return it == peers_.end() ? nullptr : &it->second.attrs;
 }
 
-Status RdmaTransport::discoverLocalDevices() {
+Status RdmaTransport::Impl::discoverLocalDevices() {
     cleanupDevices();
     topology_.clear();
 
-#if defined(TRANSPORT_ENABLE_RDMA)
     int count = 0;
     ibv_device** device_list = ibv_get_device_list(&count);
     if (device_list == nullptr) {
@@ -475,30 +728,11 @@ Status RdmaTransport::discoverLocalDevices() {
     ibv_free_device_list(device_list);
     topology_["rdma.device_count"] = std::to_string(devices_.size());
     return devices_.empty() ? Status::NotFound : Status::Ok;
-#else
-    LocalDevice device;
-    device.name = "stub0";
-    device.port_count = 1;
-    LocalQueuePair qp;
-    qp.port = 1;
-    qp.lid = 1;
-    qp.gid = "00000000000000000000000000000001";
-    qp.qp_num = 1;
-    qp.psn = local_.psn;
-    device.queue_pairs.push_back(qp);
-    devices_.push_back(std::move(device));
-    topology_["rdma.device_count"] = "1";
-    topology_["rdma.device.0.name"] = "stub0";
-    topology_["rdma.device.0.port_count"] = "1";
-    topology_["rdma.device.0.qp_count"] = "1";
-    return Status::Ok;
-#endif
 }
 
-Status RdmaTransport::initQueuePairs(LocalDevice& device, size_t device_index) {
+Status RdmaTransport::Impl::initQueuePairs(LocalDevice& device, size_t device_index) {
     device.queue_pairs.clear();
 
-#if defined(TRANSPORT_ENABLE_RDMA)
     auto* context = static_cast<ibv_context*>(device.context);
     auto* pd = static_cast<ibv_pd*>(device.protection_domain);
     if (context == nullptr || pd == nullptr || device.port_count == 0) {
@@ -556,13 +790,11 @@ Status RdmaTransport::initQueuePairs(LocalDevice& device, size_t device_index) {
 
         const auto recv_status = initReceivePool(device, local_qp);
         if (recv_status != Status::Ok) {
-#if defined(TRANSPORT_ENABLE_RDMA)
             for (auto& buffer : local_qp.receive_pool) {
                 if (buffer.memory_region != nullptr) {
                     (void)ibv_dereg_mr(static_cast<ibv_mr*>(buffer.memory_region));
                 }
             }
-#endif
             (void)ibv_destroy_qp(qp);
             (void)ibv_destroy_cq(cq);
             continue;
@@ -571,14 +803,9 @@ Status RdmaTransport::initQueuePairs(LocalDevice& device, size_t device_index) {
     }
 
     return device.queue_pairs.empty() ? Status::NotFound : Status::Ok;
-#else
-    (void)device;
-    (void)device_index;
-    return Status::Ok;
-#endif
 }
 
-Status RdmaTransport::connectQueuePair(LocalQueuePair& local_qp,
+Status RdmaTransport::Impl::connectQueuePair(LocalQueuePair& local_qp,
                                        const RdmaPeerQueuePair& peer_qp,
                                        PeerID peer) {
     if (local_qp.connected_peer == peer) {
@@ -591,7 +818,6 @@ Status RdmaTransport::connectQueuePair(LocalQueuePair& local_qp,
         return Status::InvalidArgument;
     }
 
-#if defined(TRANSPORT_ENABLE_RDMA)
     auto* native_qp = static_cast<ibv_qp*>(local_qp.queue_pair);
     if (native_qp == nullptr) {
         return Status::InvalidArgument;
@@ -648,21 +874,17 @@ Status RdmaTransport::connectQueuePair(LocalQueuePair& local_qp,
     if (ibv_modify_qp(native_qp, &rts, rts_mask) != 0) {
         return Status::Failed;
     }
-#else
-    (void)peer_qp;
-#endif
 
     local_qp.connected_peer = peer;
     return Status::Ok;
 }
 
-Status RdmaTransport::initReceivePool(LocalDevice& device, LocalQueuePair& qp) {
+Status RdmaTransport::Impl::initReceivePool(LocalDevice& device, LocalQueuePair& qp) {
     qp.receive_pool.clear();
     if (local_.recv_depth == 0 || local_.recv_buffer_size == 0) {
         return Status::Ok;
     }
 
-#if defined(TRANSPORT_ENABLE_RDMA)
     auto* pd = static_cast<ibv_pd*>(device.protection_domain);
     if (pd == nullptr) {
         return Status::InvalidArgument;
@@ -702,15 +924,10 @@ Status RdmaTransport::initReceivePool(LocalDevice& device, LocalQueuePair& qp) {
             return status;
         }
     }
-#else
-    (void)device;
-    (void)qp;
-#endif
     return Status::Ok;
 }
 
-Status RdmaTransport::postReceive(LocalQueuePair& qp, LocalReceiveBuffer& buffer) {
-#if defined(TRANSPORT_ENABLE_RDMA)
+Status RdmaTransport::Impl::postReceive(LocalQueuePair& qp, LocalReceiveBuffer& buffer) {
     auto* native_qp = static_cast<ibv_qp*>(qp.queue_pair);
     if (native_qp == nullptr || buffer.buffer.empty()) {
         return Status::InvalidArgument;
@@ -728,15 +945,9 @@ Status RdmaTransport::postReceive(LocalQueuePair& qp, LocalReceiveBuffer& buffer
 
     ibv_recv_wr* bad = nullptr;
     return ibv_post_recv(native_qp, &wr, &bad) == 0 ? Status::Ok : Status::Failed;
-#else
-    (void)qp;
-    (void)buffer;
-    return Status::Ok;
-#endif
 }
 
-Status RdmaTransport::pollCompletion(LocalQueuePair& qp, uint64_t expected_wr_id) {
-#if defined(TRANSPORT_ENABLE_RDMA)
+Status RdmaTransport::Impl::pollCompletion(LocalQueuePair& qp, uint64_t expected_wr_id) {
     auto* cq = static_cast<ibv_cq*>(qp.completion_queue);
     if (cq == nullptr) {
         return Status::InvalidArgument;
@@ -779,26 +990,20 @@ Status RdmaTransport::pollCompletion(LocalQueuePair& qp, uint64_t expected_wr_id
             return Status::Ok;
         }
     }
-#else
-    (void)qp;
-    (void)expected_wr_id;
-    return Status::Failed;
-#endif
 }
 
-Status RdmaTransport::submitTransferOnQueuePair(LocalQueuePair& qp,
+Status RdmaTransport::Impl::submitTransferOnQueuePair(LocalQueuePair& qp,
                                                 const LocalMemoryRecord& local_memory,
                                                 const RdmaMemoryAttrs& local_attrs,
                                                 const RdmaMemoryAttrs& remote_attrs,
                                                 const Transfer& transfer) {
-#if defined(TRANSPORT_ENABLE_RDMA)
     auto* native_qp = static_cast<ibv_qp*>(qp.queue_pair);
     if (native_qp == nullptr) {
         return Status::InvalidArgument;
     }
 
     ibv_sge sge{};
-    sge.addr = static_cast<uintptr_t>(transfer.local_address);
+    sge.addr = reinterpret_cast<uintptr_t>(transfer.local_addr);
     sge.length = static_cast<uint32_t>(transfer.length);
     sge.lkey = local_attrs.lkey;
 
@@ -813,11 +1018,11 @@ Status RdmaTransport::submitTransferOnQueuePair(LocalQueuePair& qp,
         wr.opcode = IBV_WR_SEND;
     } else if (transfer.opcode == Opcode::Read) {
         wr.opcode = IBV_WR_RDMA_READ;
-        wr.wr.rdma.remote_addr = transfer.target_address;
+        wr.wr.rdma.remote_addr = transfer.remote_addr;
         wr.wr.rdma.rkey = remote_attrs.rkey;
     } else if (transfer.opcode == Opcode::Write) {
         wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.wr.rdma.remote_addr = transfer.target_address;
+        wr.wr.rdma.remote_addr = transfer.remote_addr;
         wr.wr.rdma.rkey = remote_attrs.rkey;
     } else {
         return Status::InvalidArgument;
@@ -828,17 +1033,9 @@ Status RdmaTransport::submitTransferOnQueuePair(LocalQueuePair& qp,
         return Status::Failed;
     }
     return pollCompletion(qp, wr_id);
-#else
-    (void)qp;
-    (void)local_memory;
-    (void)local_attrs;
-    (void)remote_attrs;
-    (void)transfer;
-    return Status::Failed;
-#endif
 }
 
-uint64_t RdmaTransport::allocateWrID() {
+uint64_t RdmaTransport::Impl::allocateWrID() {
     auto id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
     if (id != 0) {
         return id;
@@ -846,7 +1043,7 @@ uint64_t RdmaTransport::allocateWrID() {
     return next_wr_id_.fetch_add(1, std::memory_order_relaxed);
 }
 
-Status RdmaTransport::selectTopology(const LocalMemoryRecord& local_memory,
+Status RdmaTransport::Impl::selectTopology(const LocalMemoryRecord& local_memory,
                                      const PeerState& peer,
                                      const PeerMemoryLookup* remote_memory,
                                      const Transfer& transfer,
@@ -882,7 +1079,7 @@ Status RdmaTransport::selectTopology(const LocalMemoryRecord& local_memory,
     return selectQueuePair(peer, transfer.target_id, plan.device_index, plan.qp_index);
 }
 
-Status RdmaTransport::selectQueuePair(const PeerState& peer,
+Status RdmaTransport::Impl::selectQueuePair(const PeerState& peer,
                                       PeerID peer_id,
                                       size_t device_index,
                                       size_t& qp_index) {
@@ -909,7 +1106,7 @@ Status RdmaTransport::selectQueuePair(const PeerState& peer,
     return Status::Ok;
 }
 
-std::unordered_map<MemoryHandle, RdmaTransport::LocalMemoryRecord>::iterator RdmaTransport::findLocalMemory(
+std::unordered_map<MemoryHandle, RdmaTransport::Impl::LocalMemoryRecord>::iterator RdmaTransport::Impl::findLocalMemory(
     uint64_t address,
     uint64_t length) {
     for (auto it = memories_.begin(); it != memories_.end(); ++it) {
@@ -925,7 +1122,7 @@ std::unordered_map<MemoryHandle, RdmaTransport::LocalMemoryRecord>::iterator Rdm
     return memories_.end();
 }
 
-RdmaTransport::PeerMemoryLookup RdmaTransport::findPeerMemory(PeerID peer, uint64_t address) const {
+RdmaTransport::Impl::PeerMemoryLookup RdmaTransport::Impl::findPeerMemory(PeerID peer, uint64_t address) const {
     const auto peer_it = peers_.find(peer);
     if (peer_it == peers_.end()) {
         return {};
@@ -939,7 +1136,7 @@ RdmaTransport::PeerMemoryLookup RdmaTransport::findPeerMemory(PeerID peer, uint6
     return {};
 }
 
-size_t RdmaTransport::randomIndex(size_t count) {
+size_t RdmaTransport::Impl::randomIndex(size_t count) {
     if (count <= 1) {
         return 0;
     }
@@ -947,9 +1144,8 @@ size_t RdmaTransport::randomIndex(size_t count) {
     return dist(rng_);
 }
 
-void RdmaTransport::cleanupDevices() {
+void RdmaTransport::Impl::cleanupDevices() {
     for (auto& device : devices_) {
-#if defined(TRANSPORT_ENABLE_RDMA)
         for (auto& qp : device.queue_pairs) {
             for (auto& buffer : qp.receive_pool) {
                 if (buffer.memory_region != nullptr) {
@@ -973,7 +1169,6 @@ void RdmaTransport::cleanupDevices() {
         if (device.context != nullptr) {
             (void)ibv_close_device(static_cast<ibv_context*>(device.context));
         }
-#endif
         device.protection_domain = nullptr;
         device.context = nullptr;
         device.queue_pairs.clear();
