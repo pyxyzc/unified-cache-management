@@ -187,7 +187,7 @@ void RunSingleCase(UC::Transport::Ffts::FftsTransport& transport, aclrtStream st
     });
 
     PrintResult("single", "ffts", bytes, bytes, 1, ffts);
-    PrintResult("single", "acl_async", bytes, bytes, 1, acl);
+    PrintResult("single", "acl", bytes, bytes, 1, acl);
 }
 
 void RunBatchCase(UC::Transport::Ffts::FftsTransport& transport, aclrtStream stream, size_t chunkBytes, size_t count,
@@ -218,7 +218,7 @@ void RunBatchCase(UC::Transport::Ffts::FftsTransport& transport, aclrtStream str
     });
 
     PrintResult("batch", "ffts", bytes, chunkBytes, count, ffts);
-    PrintResult("batch", "acl_async", bytes, chunkBytes, count, acl);
+    PrintResult("batch", "acl", bytes, chunkBytes, count, acl);
 }
 }  // namespace
 
