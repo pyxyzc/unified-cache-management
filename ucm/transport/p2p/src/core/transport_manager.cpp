@@ -39,6 +39,10 @@ Status TransportManager::installTransport(const std::string& protocol, const Ini
         transport = std::make_shared<HixlTransport>();
     } else if (protocol == "rdma") {
         transport = std::make_shared<RdmaTransport>();
+#if defined(UCM_TRANSPORT_ENABLE_HCCL)
+    } else if (protocol == "hccl") {
+        transport = std::make_shared<HcclTransport>();
+#endif
     } else {
         return Status::InvalidArgument;
     }

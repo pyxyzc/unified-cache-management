@@ -4,6 +4,9 @@
 #include "core/transport.h"
 #include "hixl/hixl_transport.h"
 #include "rdma/rdma_transport.h"
+#if defined(UCM_TRANSPORT_ENABLE_HCCL)
+#include "hccl/hccl_transport.h"
+#endif
 
 #include <memory>
 #include <string>
