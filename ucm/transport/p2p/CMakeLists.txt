@@ -31,6 +31,14 @@ if(UCM_ENABLE_P2P_FFTS_TRANSPORT)
         "Path to Ascend FFTS include directory")
     set(ASCEND_RUNTIME_LIBRARY "${ASCEND_ARCH_DIR}/lib64/libruntime.so" CACHE FILEPATH
         "Path to Ascend runtime library")
+    set(ASCEND_FFTS_INCLUDE_DIRS
+        "${ASCEND_FFTS_INCLUDE_DIR}"
+        "${ASCEND_PKG_INCLUDE_DIR}"
+        "${ASCEND_PKG_INCLUDE_DIR}/profiling"
+        "${ASCEND_PKG_INCLUDE_DIR}/toolchain"
+        "${ASCEND_ARCH_DIR}/include/experiment/msprof/profiling"
+        "${ASCEND_ARCH_DIR}/include/experiment/msprof/toolchain"
+    )
 
     if(NOT EXISTS "${ASCEND_RUNTIME_LIBRARY}")
         message(FATAL_ERROR
@@ -51,8 +59,7 @@ if(UCM_ENABLE_P2P_FFTS_TRANSPORT)
         TRANSPORT_P2P_ENABLE_FFTS=1
     )
     target_include_directories(p2p_transport PRIVATE
-        "${ASCEND_FFTS_INCLUDE_DIR}"
-        "${ASCEND_PKG_INCLUDE_DIR}"
+        ${ASCEND_FFTS_INCLUDE_DIRS}
     )
     target_link_libraries(p2p_transport PRIVATE
         trans
@@ -76,8 +83,7 @@ if(BUILD_UNIT_TESTS AND UCM_ENABLE_P2P_FFTS_TRANSPORT)
         TRANSPORT_P2P_ENABLE_FFTS_TESTING=1
     )
     target_include_directories(p2p_ffts.test PRIVATE
-        "${ASCEND_FFTS_INCLUDE_DIR}"
-        "${ASCEND_PKG_INCLUDE_DIR}"
+        ${ASCEND_FFTS_INCLUDE_DIRS}
     )
     target_link_libraries(p2p_ffts.test PRIVATE
         p2p_transport
