@@ -42,6 +42,39 @@ if(UCM_ENABLE_P2P_FFTS_TRANSPORT)
             "UCM_ENABLE_P2P_FFTS_TRANSPORT requires FFTS headers in: ${ASCEND_FFTS_INCLUDE_DIR}")
     endif()
 
+    if(NOT TARGET Ascend::ascendcl)
+        find_path(P2P_ASCEND_INCLUDE_DIR
+            NAMES acl/acl.h
+            HINTS
+                "${ASCEND_ROOT}/include"
+                "${ASCEND_ARCH_DIR}/include"
+            NO_DEFAULT_PATH
+        )
+        if(NOT P2P_ASCEND_INCLUDE_DIR)
+            message(FATAL_ERROR
+                "UCM_ENABLE_P2P_FFTS_TRANSPORT requires acl/acl.h under ASCEND_ROOT=${ASCEND_ROOT}")
+        endif()
+
+        find_library(P2P_ASCENDCL_LIBRARY
+            NAMES ascendcl
+            HINTS
+                "${ASCEND_ROOT}/lib64"
+                "${ASCEND_ARCH_DIR}/lib64"
+                "${ASCEND_ARCH_DIR}/devlib"
+            NO_DEFAULT_PATH
+        )
+        if(NOT P2P_ASCENDCL_LIBRARY)
+            message(FATAL_ERROR
+                "UCM_ENABLE_P2P_FFTS_TRANSPORT requires libascendcl under ASCEND_ROOT=${ASCEND_ROOT}")
+        endif()
+
+        add_library(Ascend::ascendcl UNKNOWN IMPORTED)
+        set_target_properties(Ascend::ascendcl PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${P2P_ASCEND_INCLUDE_DIR}"
+            IMPORTED_LOCATION "${P2P_ASCENDCL_LIBRARY}"
+        )
+    endif()
+
     target_sources(p2p_transport PRIVATE
         src/one_sided/core/ffts_dispatcher.cpp
         src/one_sided/core/ffts_engine.cpp
