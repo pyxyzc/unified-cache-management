@@ -3,7 +3,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <runtime/config.h>
 #include <string>
 #include <gtest/gtest.h>
 
@@ -30,6 +29,8 @@ const char* AclErrorHint(aclError ret)
             return "ACL_SUCCESS";
         case ACL_ERROR_REPEAT_INITIALIZE:
             return "ACL_ERROR_REPEAT_INITIALIZE";
+        case ACL_ERROR_RT_PARAM_INVALID:
+            return "ACL_ERROR_RT_PARAM_INVALID";
         case ACL_ERROR_RT_FEATURE_NOT_SUPPORT:
             return "ACL_ERROR_RT_FEATURE_NOT_SUPPORT";
         default:
@@ -39,9 +40,8 @@ const char* AclErrorHint(aclError ret)
 
 std::string CurrentSocVersion()
 {
-    char soc_version[128] = {};
-    const auto ret = rtGetSocVersion(soc_version, sizeof(soc_version));
-    if (ret != 0) {
+    const char* soc_version = aclrtGetSocName();
+    if (soc_version == nullptr) {
         return "unknown";
     }
     return soc_version;
@@ -55,6 +55,13 @@ HostBuffer AllocatePageAlignedHostBuffer()
     }
     std::memset(ptr, 0xab, kBufferSize);
     return HostBuffer(ptr);
+}
+
+std::string HostRegisterFailureMessage(const char* api, uint32_t flags, aclError ret)
+{
+    return std::string(api) + " failed on soc=" + CurrentSocVersion() +
+           ", flags=" + std::to_string(flags) + ", ret=" + std::to_string(ret) +
+           "(" + AclErrorHint(ret) + ")";
 }
 
 class AclDeviceGuard {
@@ -129,6 +136,40 @@ TEST_F(HostRegisterCapabilityTest, LegacyMappedHostRegisterIsSupported)
     EXPECT_EQ(ACL_SUCCESS, aclrtHostUnregister(host.get()));
 }
 
+TEST_F(HostRegisterCapabilityTest, MappedHostRegisterV2IsSupported)
+{
+    auto host = AllocatePageAlignedHostBuffer();
+    ASSERT_NE(nullptr, host.get());
+
+    const uint32_t flags = ACL_HOST_REG_MAPPED;
+    const auto register_ret = aclrtHostRegisterV2(host.get(), kBufferSize, flags);
+    ASSERT_EQ(ACL_SUCCESS, register_ret)
+        << HostRegisterFailureMessage("aclrtHostRegisterV2(MAPPED)", flags, register_ret);
+
+    void* device_ptr = nullptr;
+    const auto pointer_ret = aclrtHostGetDevicePointer(host.get(), &device_ptr, 0);
+    EXPECT_EQ(ACL_SUCCESS, pointer_ret)
+        << "aclrtHostGetDevicePointer failed on soc=" << CurrentSocVersion()
+        << ", ret=" << static_cast<int>(pointer_ret) << "(" << AclErrorHint(pointer_ret)
+        << ")";
+    EXPECT_NE(nullptr, device_ptr);
+
+    EXPECT_EQ(ACL_SUCCESS, aclrtHostUnregister(host.get()));
+}
+
+TEST_F(HostRegisterCapabilityTest, PinnedHostRegisterV2FlagIsAccepted)
+{
+    auto host = AllocatePageAlignedHostBuffer();
+    ASSERT_NE(nullptr, host.get());
+
+    const uint32_t flags = ACL_HOST_REG_PINNED;
+    const auto register_ret = aclrtHostRegisterV2(host.get(), kBufferSize, flags);
+    ASSERT_EQ(ACL_SUCCESS, register_ret)
+        << HostRegisterFailureMessage("aclrtHostRegisterV2(PINNED)", flags, register_ret);
+
+    EXPECT_EQ(ACL_SUCCESS, aclrtHostUnregister(host.get()));
+}
+
 TEST_F(HostRegisterCapabilityTest, MappedPinnedHostRegisterV2IsSupported)
 {
     auto host = AllocatePageAlignedHostBuffer();
@@ -137,9 +178,8 @@ TEST_F(HostRegisterCapabilityTest, MappedPinnedHostRegisterV2IsSupported)
     const uint32_t flags = ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED;
     const auto register_ret = aclrtHostRegisterV2(host.get(), kBufferSize, flags);
     ASSERT_EQ(ACL_SUCCESS, register_ret)
-        << "aclrtHostRegisterV2(MAPPED|PINNED) is not supported or failed on soc="
-        << CurrentSocVersion() << ", ret=" << static_cast<int>(register_ret) << "("
-        << AclErrorHint(register_ret) << ")";
+        << HostRegisterFailureMessage("aclrtHostRegisterV2(MAPPED|PINNED)", flags,
+                                      register_ret);
 
     void* device_ptr = nullptr;
     const auto pointer_ret = aclrtHostGetDevicePointer(host.get(), &device_ptr, 0);

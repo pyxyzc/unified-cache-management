@@ -82,9 +82,8 @@ protected:
 
 TEST_F(FftsEngineCopyTest, DeviceToDeviceCopyMovesBytes)
 {
-    char soc_version[128] = {};
-    const auto soc_ret = rtGetSocVersion(soc_version, sizeof(soc_version));
-    ASSERT_EQ(soc_ret, 0) << "rtGetSocVersion failed: " << static_cast<int>(soc_ret);
+    const char* soc_version = aclrtGetSocName();
+    ASSERT_NE(nullptr, soc_version) << "aclrtGetSocName failed";
 
     int ffts_mode = RT_MODE_NO_FFTS;
     const auto cap_ret = rtGetDeviceCapability(kDeviceId, RT_MODULE_TYPE_TSCPU,
