@@ -12,6 +12,19 @@ namespace {
 constexpr int kDeviceId = 0;
 constexpr size_t kCopySize = 4096;
 
+const char* StatusName(Status status)
+{
+    switch (status) {
+        case Status::Ok:
+            return "Ok";
+        case Status::InvalidArgument:
+            return "InvalidArgument";
+        case Status::Failed:
+            return "Failed";
+    }
+    return "Unknown";
+}
+
 struct DeviceDeleter {
     void operator()(void* ptr) const
     {
@@ -76,11 +89,18 @@ TEST_F(FftsEngineCopyTest, DeviceToDeviceCopyMovesBytes)
     FftsEngineOptions options;
     options.device_id = kDeviceId;
     options.max_ready_lanes = 8;
-    ASSERT_EQ(Status::Ok, engine.Init(options));
+    const auto init_status = engine.Init(options);
+    ASSERT_EQ(Status::Ok, init_status) << "FftsEngine::Init failed: "
+                                       << StatusName(init_status);
 
-    EXPECT_EQ(Status::Ok,
-              engine.Submit({FftsCopySpec{dst_device.get(), src_device.get(), kCopySize}}));
-    EXPECT_EQ(Status::Ok, engine.Shutdown());
+    const auto submit_status =
+        engine.Submit({FftsCopySpec{dst_device.get(), src_device.get(), kCopySize}});
+    ASSERT_EQ(Status::Ok, submit_status) << "FftsEngine::Submit failed: "
+                                         << StatusName(submit_status);
+
+    const auto shutdown_status = engine.Shutdown();
+    EXPECT_EQ(Status::Ok, shutdown_status) << "FftsEngine::Shutdown failed: "
+                                           << StatusName(shutdown_status);
 
     ASSERT_EQ(aclrtMemcpy(actual.data(), actual.size(), dst_device.get(), kCopySize,
                           ACL_MEMCPY_DEVICE_TO_HOST),

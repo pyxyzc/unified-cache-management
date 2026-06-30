@@ -7,6 +7,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 get_filename_component(P2P_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+get_filename_component(REPO_ROOT "${P2P_ROOT}/../../.." ABSOLUTE)
+set(UCM_ROOT "${REPO_ROOT}/ucm")
+list(APPEND CMAKE_MODULE_PATH "${UCM_ROOT}/shared/vendor")
+
+option(DOWNLOAD_DEPENDENCE "download dependence by cmake." ON)
 
 if(NOT DEFINED ASCEND_ROOT)
     if(DEFINED ENV{ASCEND_HOME_PATH})
@@ -68,20 +73,25 @@ if(NOT ASCEND_RUNTIME_LIBRARY)
 endif()
 
 find_package(Threads REQUIRED)
-find_package(GTest QUIET)
-if(GTest_FOUND)
-    set(P2P_FFTS_GTEST_MAIN GTest::gtest_main)
-else()
-    include(FetchContent)
-    set(INSTALL_GTEST OFF CACHE INTERNAL "" FORCE)
-    FetchContent_Declare(googletest
-        GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG v1.15.2
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_MakeAvailable(googletest)
-    set(P2P_FFTS_GTEST_MAIN gtest_main)
-endif()
+include("${UCM_ROOT}/shared/vendor/dep-fmt.cmake")
+include("${UCM_ROOT}/shared/vendor/dep-spdlog.cmake")
+include("${UCM_ROOT}/shared/vendor/dep-zlib.cmake")
+include("${UCM_ROOT}/shared/vendor/dep-googletest.cmake")
+
+add_library(infra_logger STATIC
+    "${UCM_ROOT}/shared/infra/logger/logger.cc"
+    "${UCM_ROOT}/shared/infra/logger/cc/spdlog_logger.cc"
+)
+target_include_directories(infra_logger PUBLIC
+    "${UCM_ROOT}/shared/infra"
+    "${UCM_ROOT}/shared/infra/logger"
+    "${UCM_ROOT}/shared/infra/logger/cc"
+)
+target_link_libraries(infra_logger PUBLIC
+    fmt
+    spdlog
+    zlibstatic
+)
 
 add_library(p2p_ffts_under_test STATIC
     "${P2P_ROOT}/src/one_sided/core/ffts_dispatcher.cpp"
@@ -97,8 +107,8 @@ target_include_directories(p2p_ffts_under_test
     PUBLIC
         "${P2P_ROOT}/include/one_sided"
     PRIVATE
-        "${CMAKE_CURRENT_LIST_DIR}/stubs"
         "${P2P_ROOT}/src/one_sided/core"
+        "${UCM_ROOT}/shared/infra"
         "${ASCEND_ACL_INCLUDE_DIR}"
         "${ASCEND_PKG_INCLUDE_DIR}"
         "${ASCEND_FFTS_INCLUDE_DIR}"
@@ -107,6 +117,7 @@ target_link_libraries(p2p_ffts_under_test
     PRIVATE
         "${ASCENDCL_LIBRARY}"
         "${ASCEND_RUNTIME_LIBRARY}"
+        infra_logger
         Threads::Threads
 )
 
@@ -125,7 +136,7 @@ target_include_directories(p2p_ffts.test PRIVATE
 target_link_libraries(p2p_ffts.test PRIVATE
     p2p_ffts_under_test
     "${ASCENDCL_LIBRARY}"
-    "${P2P_FFTS_GTEST_MAIN}"
+    gtest_main
 )
 
 include(GoogleTest)
