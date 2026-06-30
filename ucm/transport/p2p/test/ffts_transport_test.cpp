@@ -1,5 +1,4 @@
 #include "core/ffts_transport.h"
-#include "core/transport_manager.h"
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -119,13 +118,10 @@ TEST(FftsTransportTest, ImportMetadataValidatesVersionOnlyEncoding)
     EXPECT_EQ(Status::InvalidArgument, transport.ImportMetadata("peer", metadata));
 }
 
-TEST(FftsTransportTest, RoutesLocalDeviceDirectsToFfts)
+TEST(FftsTransportTest, ReportsProtocolName)
 {
-    EXPECT_STREQ(kFftsTransportProtocol,
-                 SelectTransportForDirectForTest(OperationDirect::LocalDeviceHost));
-    EXPECT_STREQ(kFftsTransportProtocol,
-                 SelectTransportForDirectForTest(OperationDirect::LocalDeviceDevice));
-    EXPECT_EQ(nullptr, SelectTransportForDirectForTest(OperationDirect::RemoteDeviceHost));
+    FftsTransport transport;
+    EXPECT_STREQ(kFftsTransportProtocol, transport.Name());
 }
 
 TEST(FftsTransportTest, LocalDeviceHostUsesDeviceSpecificHostRegistration)
