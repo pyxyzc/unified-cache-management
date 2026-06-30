@@ -59,3 +59,27 @@ if(UCM_ENABLE_P2P_FFTS_TRANSPORT)
         "${ASCEND_RUNTIME_LIBRARY}"
     )
 endif()
+
+if(BUILD_UNIT_TESTS AND UCM_ENABLE_P2P_FFTS_TRANSPORT)
+    target_compile_definitions(p2p_transport PRIVATE
+        TRANSPORT_P2P_ENABLE_FFTS_TESTING=1
+    )
+    include(GoogleTest)
+    add_executable(p2p_ffts.test
+        test/ffts_dispatcher_test.cpp
+        test/ffts_engine_copy_test.cpp
+        test/ffts_engine_test.cpp
+        test/ffts_transport_test.cpp
+    )
+    target_compile_definitions(p2p_ffts.test PRIVATE
+        TRANSPORT_P2P_ENABLE_FFTS_TESTING=1
+    )
+    target_link_libraries(p2p_ffts.test PRIVATE
+        p2p_transport
+        Ascend::ascendcl
+        "${ASCEND_RUNTIME_LIBRARY}"
+        gtest_main
+        gtest
+    )
+    gtest_discover_tests(p2p_ffts.test)
+endif()

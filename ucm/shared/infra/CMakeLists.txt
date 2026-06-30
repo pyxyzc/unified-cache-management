@@ -7,12 +7,15 @@ add_subdirectory(logger)
 
 file(GLOB_RECURSE UCMINFRA_TEMPLATE_SOURCE_FILES "template/*.*")
 add_library(infra_template OBJECT ${UCMINFRA_TEMPLATE_SOURCE_FILES})
+set_target_properties(infra_template PROPERTIES LINKER_LANGUAGE CXX)
 target_include_directories(infra_template PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 file(GLOB_RECURSE UCMINFRA_THREAD_SOURCE_FILES "thread/*.*")
 add_library(infra_thread OBJECT ${UCMINFRA_THREAD_SOURCE_FILES})
+set_target_properties(infra_thread PROPERTIES LINKER_LANGUAGE CXX)
 target_include_directories(infra_thread PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 file(GLOB_RECURSE UCMINFRA_TIME_SOURCE_FILES "time/*.*")
 add_library(infra_time OBJECT ${UCMINFRA_TIME_SOURCE_FILES})
+set_target_properties(infra_time PROPERTIES LINKER_LANGUAGE CXX)
 target_include_directories(infra_time PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
