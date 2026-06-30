@@ -60,4 +60,8 @@ private:
     MemoryHandle next_memory_handle_ = 1;
 };
 
+#ifdef TRANSPORT_P2P_ENABLE_FFTS_TESTING
+const char* SelectTransportForDirectForTest(OperationDirect direct);
+#endif
+
 }  // namespace transport

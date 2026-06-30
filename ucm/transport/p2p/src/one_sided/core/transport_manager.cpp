@@ -110,6 +110,13 @@ const char* TransportForDirect(OperationDirect direct)
 
 }  // namespace
 
+#ifdef TRANSPORT_P2P_ENABLE_FFTS_TESTING
+const char* SelectTransportForDirectForTest(OperationDirect direct)
+{
+    return TransportForDirect(direct);
+}
+#endif
+
 TransportManager::TransportManager(ManagerID manager_id) : manager_id_(std::move(manager_id)) {}
 
 TransportManager::~TransportManager()
