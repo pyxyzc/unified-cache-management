@@ -55,7 +55,7 @@ if(UCM_ENABLE_P2P_FFTS_TRANSPORT)
         "${ASCEND_PKG_INCLUDE_DIR}"
     )
     target_link_libraries(p2p_transport PRIVATE
-        Ascend::ascendcl
+        trans
         "${ASCEND_RUNTIME_LIBRARY}"
     )
 endif()
@@ -76,7 +76,7 @@ if(BUILD_UNIT_TESTS AND UCM_ENABLE_P2P_FFTS_TRANSPORT)
     )
     target_link_libraries(p2p_ffts.test PRIVATE
         p2p_transport
-        Ascend::ascendcl
+        trans
         "${ASCEND_RUNTIME_LIBRARY}"
         gtest_main
         gtest
