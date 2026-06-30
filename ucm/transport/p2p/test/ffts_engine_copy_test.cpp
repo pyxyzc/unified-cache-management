@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include <runtime/config.h>
+#include <runtime/dev.h>
 #include <gtest/gtest.h>
 
 namespace transport {
@@ -43,6 +45,20 @@ std::vector<std::uint8_t> MakePattern(size_t size)
     return pattern;
 }
 
+const char* FftsModeName(int mode)
+{
+    switch (mode) {
+        case RT_MODE_NO_FFTS:
+            return "NO_FFTS";
+        case RT_MODE_FFTS:
+            return "FFTS";
+        case RT_MODE_FFTS_PLUS:
+            return "FFTS_PLUS";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 class FftsEngineCopyTest : public ::testing::Test {
 protected:
     static void SetUpTestSuite()
@@ -66,6 +82,22 @@ protected:
 
 TEST_F(FftsEngineCopyTest, DeviceToDeviceCopyMovesBytes)
 {
+    char soc_version[128] = {};
+    const auto soc_ret = rtGetSocVersion(soc_version, sizeof(soc_version));
+    ASSERT_EQ(soc_ret, 0) << "rtGetSocVersion failed: " << static_cast<int>(soc_ret);
+
+    int ffts_mode = RT_MODE_NO_FFTS;
+    const auto cap_ret = rtGetDeviceCapability(kDeviceId, RT_MODULE_TYPE_TSCPU,
+                                               FEATURE_TYPE_FFTS_MODE, &ffts_mode);
+    if (cap_ret != 0) {
+        GTEST_SKIP() << "Cannot query FFTS mode on soc=" << soc_version
+                     << ", rtGetDeviceCapability ret=" << static_cast<int>(cap_ret);
+    }
+    if (ffts_mode != RT_MODE_FFTS_PLUS) {
+        GTEST_SKIP() << "FFTS plus is not available on soc=" << soc_version
+                     << ", mode=" << FftsModeName(ffts_mode) << "(" << ffts_mode << ")";
+    }
+
     void* src_raw = nullptr;
     ASSERT_EQ(aclrtMalloc(&src_raw, kCopySize, ACL_MEM_TYPE_HIGH_BAND_WIDTH), ACL_SUCCESS);
     DevicePtr src_device(src_raw);

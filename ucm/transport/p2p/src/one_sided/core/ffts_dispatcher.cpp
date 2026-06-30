@@ -158,7 +158,20 @@ Status FftsDispatcher::Launch(void* stream)
     const auto ret =
         rtFftsPlusTaskLaunchWithFlag(&task, reinterpret_cast<rtStream_t>(stream), 0);
     if (ret == RT_ERROR_NONE) { return Status::Ok; }
-    UC_ERROR("FFTS failed to launch FFTS plus task ret={}", static_cast<int32_t>(ret));
+    const auto* first_ctx =
+        reinterpret_cast<const rtFftsPlusSdmaCtx_t*>(&impl_->contexts.front());
+    UC_ERROR("FFTS failed to launch FFTS plus task ret={} ret_hex=0x{:x} "
+             "total_contexts={} ready_contexts={} preload_contexts={} desc_len={} "
+             "desc_addr_type={} first_context_type={} first_sdma_header=0x{:x} "
+             "first_src=0x{:x} first_dst=0x{:x} first_non_tail_len={} first_tail_len={}",
+             static_cast<int32_t>(ret), static_cast<uint32_t>(ret), impl_->contexts.size(),
+             impl_->ready_context_num, sqe.preloadContextNum, task.descBufLen, task.descAddrType,
+             first_ctx->contextType, first_ctx->sdmaSqeHeader,
+             (static_cast<uint64_t>(first_ctx->sourceAddressBaseH) << 32U) |
+                 first_ctx->sourceAddressBaseL,
+             (static_cast<uint64_t>(first_ctx->destinationAddressBaseH) << 32U) |
+                 first_ctx->destinationAddressBaseL,
+             first_ctx->nonTailDataLength, first_ctx->tailDataLength);
     return Status::Failed;
 }
 

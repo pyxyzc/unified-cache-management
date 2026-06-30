@@ -74,6 +74,10 @@ if(BUILD_UNIT_TESTS AND UCM_ENABLE_P2P_FFTS_TRANSPORT)
     target_compile_definitions(p2p_ffts.test PRIVATE
         TRANSPORT_P2P_ENABLE_FFTS_TESTING=1
     )
+    target_include_directories(p2p_ffts.test PRIVATE
+        "${ASCEND_FFTS_INCLUDE_DIR}"
+        "${ASCEND_PKG_INCLUDE_DIR}"
+    )
     target_link_libraries(p2p_ffts.test PRIVATE
         p2p_transport
         trans
