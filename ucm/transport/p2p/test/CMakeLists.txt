@@ -112,14 +112,19 @@ target_link_libraries(p2p_ffts_under_test
 
 add_executable(p2p_ffts.test
     ffts_dispatcher_test.cpp
+    ffts_engine_copy_test.cpp
     ffts_engine_test.cpp
     ffts_transport_test.cpp
 )
 target_compile_definitions(p2p_ffts.test PRIVATE
     TRANSPORT_P2P_ENABLE_FFTS_TESTING=1
 )
+target_include_directories(p2p_ffts.test PRIVATE
+    "${ASCEND_ACL_INCLUDE_DIR}"
+)
 target_link_libraries(p2p_ffts.test PRIVATE
     p2p_ffts_under_test
+    "${ASCENDCL_LIBRARY}"
     "${P2P_FFTS_GTEST_MAIN}"
 )
 
