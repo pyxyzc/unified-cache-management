@@ -70,6 +70,7 @@ if(BUILD_UNIT_TESTS AND UCM_ENABLE_P2P_FFTS_TRANSPORT)
         test/ffts_engine_copy_test.cpp
         test/ffts_engine_test.cpp
         test/ffts_transport_test.cpp
+        test/host_register_capability_test.cpp
     )
     target_compile_definitions(p2p_ffts.test PRIVATE
         TRANSPORT_P2P_ENABLE_FFTS_TESTING=1
