@@ -232,22 +232,6 @@ Status FftsEngine::RegisterHostMemory(void* host, size_t size,
                               });
 }
 
-Status FftsEngine::MapRegisteredHostMemory(void* host, size_t size,
-                                           FftsMemoryRegistration& registration)
-{
-    registration = {};
-    if (host == nullptr || size == 0) { return Status::InvalidArgument; }
-
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (!impl_->device_context.IsInitialized()) { return Status::Failed; }
-
-    return impl_->RunOnDevice(impl_->device_context.DeviceId(),
-                              [this, host, size, &registration]() {
-                                  return impl_->MapHostOnCurrentDevice(host, size, false,
-                                                                       registration);
-                              });
-}
-
 Status FftsEngine::UnregisterHostMemory(const FftsMemoryRegistration& registration)
 {
     if (!registration.requires_unregister) { return Status::Ok; }

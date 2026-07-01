@@ -48,10 +48,6 @@ TEST(FftsEngineTest, RejectsInvalidMemoryRegistrationInputs)
     EXPECT_EQ(Status::InvalidArgument,
               engine.RegisterHostMemory(memory.data(), 0, registration));
     EXPECT_EQ(Status::InvalidArgument,
-              engine.MapRegisteredHostMemory(nullptr, memory.size(), registration));
-    EXPECT_EQ(Status::InvalidArgument,
-              engine.MapRegisteredHostMemory(memory.data(), 0, registration));
-    EXPECT_EQ(Status::InvalidArgument,
               engine.RegisterDeviceMemory(nullptr, memory.size(), registration));
     EXPECT_EQ(Status::InvalidArgument,
               engine.RegisterDeviceMemory(memory.data(), 0, registration));
@@ -65,8 +61,6 @@ TEST(FftsEngineTest, UninitializedHostMemoryRegistrationFails)
 
     EXPECT_EQ(Status::Failed,
               engine.RegisterHostMemory(memory.data(), memory.size(), registration));
-    EXPECT_EQ(Status::Failed,
-              engine.MapRegisteredHostMemory(memory.data(), memory.size(), registration));
     EXPECT_EQ(nullptr, registration.origin_addr);
     EXPECT_EQ(nullptr, registration.ffts_addr);
     EXPECT_EQ(0U, registration.size);

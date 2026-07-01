@@ -18,7 +18,6 @@ struct FakeEngineState {
     std::vector<std::pair<int, uint16_t>> inits;
     std::vector<int> shutdowns;
     std::vector<std::pair<int, void*>> host_registrations;
-    std::vector<std::pair<int, void*>> host_mappings;
     std::vector<std::pair<int, void*>> device_registrations;
     std::vector<SubmittedBatch> submissions;
 };
@@ -57,15 +56,6 @@ FftsTransport::EngineHooks MakeHooks(const std::shared_ptr<FakeEngineState>& sta
         registration.ffts_addr = HostVisibleAddress(host, device_id);
         registration.size = size;
         registration.requires_unregister = true;
-        return Status::Ok;
-    };
-    hooks.map_host = [state](int device_id, void* host, size_t size,
-                             FftsMemoryRegistration& registration) {
-        state->host_mappings.emplace_back(device_id, host);
-        registration.origin_addr = host;
-        registration.ffts_addr = HostVisibleAddress(host, device_id);
-        registration.size = size;
-        registration.requires_unregister = false;
         return Status::Ok;
     };
     hooks.unregister_host = [](int, const FftsMemoryRegistration&) { return Status::Ok; };
@@ -134,7 +124,7 @@ TEST(FftsTransportTest, ReportsProtocolName)
     EXPECT_STREQ(kFftsTransportProtocol, transport.Name());
 }
 
-TEST(FftsTransportTest, LocalDeviceHostRegistersHostOnceAndMapsPerDevice)
+TEST(FftsTransportTest, LocalDeviceHostUsesDeviceSpecificHostRegistration)
 {
     auto state = std::make_shared<FakeEngineState>();
     FftsTransport transport(MakeHooks(state));
@@ -160,12 +150,11 @@ TEST(FftsTransportTest, LocalDeviceHostRegistersHostOnceAndMapsPerDevice)
     op.ops.push_back(Segment{host.data(), PtrToU64(device.data()), 8});
 
     ASSERT_EQ(Status::Ok, transport.Execute(op));
-    ASSERT_EQ(1U, state->host_registrations.size());
+    ASSERT_EQ(2U, state->host_registrations.size());
     EXPECT_EQ(0, state->host_registrations[0].first);
     EXPECT_EQ(host.data(), state->host_registrations[0].second);
-    ASSERT_EQ(1U, state->host_mappings.size());
-    EXPECT_EQ(1, state->host_mappings[0].first);
-    EXPECT_EQ(host.data(), state->host_mappings[0].second);
+    EXPECT_EQ(1, state->host_registrations[1].first);
+    EXPECT_EQ(host.data(), state->host_registrations[1].second);
     ASSERT_EQ(1U, state->device_registrations.size());
     ASSERT_EQ(1U, state->submissions.size());
     EXPECT_EQ(1, state->submissions[0].device_id);
