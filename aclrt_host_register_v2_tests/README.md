@@ -16,8 +16,12 @@
 
 1. 同一个进程内，`aclrtSetDevice(0)` 后注册一个 host pointer，然后
    `aclrtSetDevice(1)`，再注册同一个 host pointer。
+   - `case1a`：第一次注册后不 unregister，直接切 device 后第二次注册。
+   - `case1b`：第一次注册后先 unregister，再切 device 后第二次注册。
 2. 同一个进程内，`aclrtSetDevice(0)` 后对同一个 host pointer 连续调用两次
    `aclrtHostRegisterV2`。
+   - `case2a`：第一次注册后不 unregister，直接第二次注册。
+   - `case2b`：第一次注册后先 unregister，再第二次注册。
 
 如果机器上少于 2 张卡，第 1 个测试会自动跳过，第 2 个测试仍然执行。
 

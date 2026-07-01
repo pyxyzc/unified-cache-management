@@ -42,6 +42,10 @@ std::string AclErrorHint(aclError ret)
             return "ACL_ERROR_RT_FEATURE_NOT_SUPPORT";
         case ACL_ERROR_RT_NO_DEVICE:
             return "ACL_ERROR_RT_NO_DEVICE";
+        case 507910:
+            return "ACL_ERROR_HOST_MEMORY_ALREADY_REGISTERED";
+        case 507911:
+            return "ACL_ERROR_HOST_MEMORY_NOT_REGISTERED";
         default:
             return "unknown";
     }
@@ -258,30 +262,24 @@ RegisterResult RegisterCurrentDevice(const char* label, void* host, size_t size,
     return result;
 }
 
-void UnregisterOnDevice(AclRuntime& runtime, int device, const char* label, void* host)
+bool UnregisterOnDevice(AclRuntime& runtime, int device, const char* label, void* host)
 {
     const aclError set_ret = runtime.SetDevice(device);
     std::cout << "  " << label << " set-device(" << device << ") ret="
               << FormatAclRet(set_ret) << "\n";
     if (set_ret != ACL_SUCCESS) {
-        return;
+        return false;
     }
 
     const aclError ret = aclrtHostUnregister(host);
     std::cout << "  " << label << " unregister ret=" << FormatAclRet(ret) << "\n";
+    return ret == ACL_SUCCESS;
 }
 
-bool RunCrossDeviceSamePointer(AclRuntime& runtime, const Options& options,
-                               uint32_t device_count)
+bool RunCrossDeviceWithoutUnregister(AclRuntime& runtime, const Options& options)
 {
-    std::cout << "\n[case1] same process, same host pointer, device "
-              << options.device0 << " then device " << options.device1 << "\n";
-
-    if (options.device0 >= static_cast<int>(device_count) ||
-        options.device1 >= static_cast<int>(device_count)) {
-        std::cout << "  SKIP: device_count=" << device_count << "\n";
-        return true;
-    }
+    std::cout << "\n[case1a] device " << options.device0 << " register, then device "
+              << options.device1 << " register without unregister\n";
 
     PageAlignedHostBuffer host(options.size);
     if (!host) {
@@ -320,15 +318,73 @@ bool RunCrossDeviceSamePointer(AclRuntime& runtime, const Options& options,
     return true;
 }
 
-bool RunDuplicateRegisterSameDevice(AclRuntime& runtime, const Options& options,
-                                    uint32_t device_count)
+bool RunCrossDeviceAfterUnregister(AclRuntime& runtime, const Options& options)
 {
-    std::cout << "\n[case2] same process, same device, register same host pointer twice\n";
+    std::cout << "\n[case1b] device " << options.device0 << " register, unregister, then device "
+              << options.device1 << " register same host pointer\n";
 
-    if (options.device0 >= static_cast<int>(device_count)) {
+    PageAlignedHostBuffer host(options.size);
+    if (!host) {
+        std::cerr << "  FAIL: posix_memalign failed\n";
+        return false;
+    }
+    std::cout << "  host=" << host.data() << ", size=" << host.size() << "\n";
+
+    aclError set_ret = runtime.SetDevice(options.device0);
+    std::cout << "  first set-device(" << options.device0 << ") ret="
+              << FormatAclRet(set_ret) << "\n";
+    if (set_ret != ACL_SUCCESS) {
+        return false;
+    }
+
+    const RegisterResult first =
+        RegisterCurrentDevice("first/device0", host.data(), host.size(), options.flags);
+    if (!first.registered) {
+        return false;
+    }
+
+    if (!UnregisterOnDevice(runtime, options.device0, "between/device0", host.data())) {
+        return false;
+    }
+
+    set_ret = runtime.SetDevice(options.device1);
+    std::cout << "  second set-device(" << options.device1 << ") ret="
+              << FormatAclRet(set_ret) << "\n";
+    if (set_ret != ACL_SUCCESS) {
+        return false;
+    }
+
+    const RegisterResult second =
+        RegisterCurrentDevice("second/device1", host.data(), host.size(), options.flags);
+
+    if (second.registered) {
+        UnregisterOnDevice(runtime, options.device1, "cleanup/device1", host.data());
+    }
+    return true;
+}
+
+bool RunCrossDeviceSamePointer(AclRuntime& runtime, const Options& options,
+                               uint32_t device_count)
+{
+    std::cout << "\n[case1] same process, same host pointer, device "
+              << options.device0 << " then device " << options.device1 << "\n";
+
+    if (options.device0 >= static_cast<int>(device_count) ||
+        options.device1 >= static_cast<int>(device_count)) {
         std::cout << "  SKIP: device_count=" << device_count << "\n";
         return true;
     }
+
+    bool ok = true;
+    ok = RunCrossDeviceWithoutUnregister(runtime, options) && ok;
+    ok = RunCrossDeviceAfterUnregister(runtime, options) && ok;
+    return ok;
+}
+
+bool RunDuplicateRegisterWithoutUnregister(AclRuntime& runtime, const Options& options)
+{
+    std::cout << "\n[case2a] device " << options.device0
+              << " register same host pointer twice without unregister\n";
 
     PageAlignedHostBuffer host(options.size);
     if (!host) {
@@ -358,6 +414,60 @@ bool RunDuplicateRegisterSameDevice(AclRuntime& runtime, const Options& options,
     }
     UnregisterOnDevice(runtime, options.device0, "cleanup/first", host.data());
     return true;
+}
+
+bool RunDuplicateRegisterAfterUnregister(AclRuntime& runtime, const Options& options)
+{
+    std::cout << "\n[case2b] device " << options.device0
+              << " register, unregister, then register same host pointer again\n";
+
+    PageAlignedHostBuffer host(options.size);
+    if (!host) {
+        std::cerr << "  FAIL: posix_memalign failed\n";
+        return false;
+    }
+    std::cout << "  host=" << host.data() << ", size=" << host.size() << "\n";
+
+    aclError set_ret = runtime.SetDevice(options.device0);
+    std::cout << "  set-device(" << options.device0 << ") ret="
+              << FormatAclRet(set_ret) << "\n";
+    if (set_ret != ACL_SUCCESS) {
+        return false;
+    }
+
+    const RegisterResult first =
+        RegisterCurrentDevice("first", host.data(), host.size(), options.flags);
+    if (!first.registered) {
+        return false;
+    }
+
+    if (!UnregisterOnDevice(runtime, options.device0, "between/first", host.data())) {
+        return false;
+    }
+
+    const RegisterResult second =
+        RegisterCurrentDevice("second", host.data(), host.size(), options.flags);
+
+    if (second.registered) {
+        UnregisterOnDevice(runtime, options.device0, "cleanup/second", host.data());
+    }
+    return true;
+}
+
+bool RunDuplicateRegisterSameDevice(AclRuntime& runtime, const Options& options,
+                                    uint32_t device_count)
+{
+    std::cout << "\n[case2] same process, same device, register same host pointer twice\n";
+
+    if (options.device0 >= static_cast<int>(device_count)) {
+        std::cout << "  SKIP: device_count=" << device_count << "\n";
+        return true;
+    }
+
+    bool ok = true;
+    ok = RunDuplicateRegisterWithoutUnregister(runtime, options) && ok;
+    ok = RunDuplicateRegisterAfterUnregister(runtime, options) && ok;
+    return ok;
 }
 
 }  // namespace
