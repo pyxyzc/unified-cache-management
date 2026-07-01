@@ -456,14 +456,11 @@ Status FftsTransport::UnregisterMemory(MemoryHandle handle)
 
 Status FftsTransport::ExportMetadata(const ManagerID& manager_id, Metadata& out)
 {
-    (void)manager_id;
-    out.clear();
     return detail::AppendU32(out, kMetadataVersion) ? Status::Ok : Status::InvalidArgument;
 }
 
 Status FftsTransport::ImportMetadata(const ManagerID& manager_id, const Metadata& metadata)
 {
-    (void)manager_id;
     size_t offset = 0;
     uint32_t version = 0;
     if (!detail::ReadU32(metadata, offset, version)) {
