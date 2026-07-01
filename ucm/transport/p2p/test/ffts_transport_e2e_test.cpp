@@ -430,7 +430,8 @@ Segment SegmentFor(void* local_addr, const void* remote_addr, uint64_t length)
         transport.RegisterMemory(MemoryRegion{host, size, MemoryType::Host, -1}, handle);
     if (status != Status::Ok) {
         return ::testing::AssertionFailure()
-               << "RegisterMemory(Host) failed, status=" << StatusName(status);
+               << "RegisterMemory(Host) failed on soc=" << CurrentSocName()
+               << ", status=" << StatusName(status);
     }
     if (handle == kInvalidMemoryHandle) {
         return ::testing::AssertionFailure()
