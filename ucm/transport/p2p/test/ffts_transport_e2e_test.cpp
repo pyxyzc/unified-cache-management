@@ -1,7 +1,6 @@
 #include "core/ffts_transport.h"
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -18,6 +17,9 @@ namespace {
 constexpr int kDeviceCount = 8;
 constexpr size_t kCopySize = 16;
 constexpr uint16_t kMaxReadyLanes = 8;
+constexpr int kStartTimeoutSeconds = 5;
+constexpr int kSubmitObserveTimeoutSeconds = 5;
+constexpr int kSubmitReleaseTimeoutSeconds = 10;
 
 struct SubmittedBatch {
     int device_id = -1;
@@ -26,23 +28,17 @@ struct SubmittedBatch {
 
 struct ConcurrentEngineState {
     std::mutex mutex;
+    std::condition_variable submit_cv;
     std::vector<std::pair<int, uint16_t>> inits;
     std::vector<SubmittedBatch> submissions;
-    std::atomic<int> entered_submits{0};
-    std::atomic<int> in_flight_submits{0};
-    std::atomic<int> max_in_flight_submits{0};
+    int in_flight_submits = 0;
+    int max_in_flight_submits = 0;
+    bool release_submits = false;
 };
 
 uint64_t PtrToU64(const void* ptr)
 {
     return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr));
-}
-
-void UpdateMax(std::atomic<int>& max_value, int candidate)
-{
-    int observed = max_value.load(std::memory_order_relaxed);
-    while (observed < candidate &&
-           !max_value.compare_exchange_weak(observed, candidate, std::memory_order_relaxed)) {}
 }
 
 FftsTransport::EngineHooks MakeHooks(const std::shared_ptr<ConcurrentEngineState>& state)
@@ -68,23 +64,20 @@ FftsTransport::EngineHooks MakeHooks(const std::shared_ptr<ConcurrentEngineState
     };
     hooks.unregister_device = [](int, const FftsMemoryRegistration&) { return Status::Ok; };
     hooks.submit = [state](int device_id, const std::vector<FftsCopySpec>& copies) {
-        const auto active = state->in_flight_submits.fetch_add(1, std::memory_order_acq_rel) + 1;
-        UpdateMax(state->max_in_flight_submits, active);
-        state->entered_submits.fetch_add(1, std::memory_order_acq_rel);
+        std::unique_lock<std::mutex> lock(state->mutex);
+        ++state->in_flight_submits;
+        state->max_in_flight_submits =
+            std::max(state->max_in_flight_submits, state->in_flight_submits);
+        state->submissions.push_back(SubmittedBatch{device_id, copies});
+        state->submit_cv.notify_all();
 
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            state->submissions.push_back(SubmittedBatch{device_id, copies});
-        }
+        const auto released = state->submit_cv.wait_for(
+            lock, std::chrono::seconds(kSubmitReleaseTimeoutSeconds),
+            [state]() { return state->release_submits; });
 
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-        while (state->entered_submits.load(std::memory_order_acquire) < kDeviceCount &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-
-        state->in_flight_submits.fetch_sub(1, std::memory_order_acq_rel);
-        return Status::Ok;
+        --state->in_flight_submits;
+        state->submit_cv.notify_all();
+        return released ? Status::Ok : Status::Failed;
     };
     return hooks;
 }
@@ -164,18 +157,35 @@ TEST(FftsTransportE2ETest, ConcurrentExecuteSubmitsToEightDevices)
 
     {
         std::unique_lock<std::mutex> lock(start_mutex);
-        start_cv.wait(lock, [&ready_threads]() { return ready_threads == kDeviceCount; });
+        const auto all_ready = start_cv.wait_for(
+            lock, std::chrono::seconds(kStartTimeoutSeconds),
+            [&ready_threads]() { return ready_threads == kDeviceCount; });
+        EXPECT_TRUE(all_ready) << "Timed out waiting for worker threads to reach start line";
         start = true;
     }
     start_cv.notify_all();
 
+    bool observed_concurrent_submit = false;
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        observed_concurrent_submit = state->submit_cv.wait_for(
+            lock, std::chrono::seconds(kSubmitObserveTimeoutSeconds),
+            [state]() { return state->max_in_flight_submits > 1; });
+        state->release_submits = true;
+    }
+    state->submit_cv.notify_all();
+
     for (auto& worker : workers) { worker.join(); }
 
     for (const auto result : results) { EXPECT_EQ(Status::Ok, result); }
+    EXPECT_TRUE(observed_concurrent_submit)
+        << "Timed out waiting for multiple Execute calls to reach submit";
 
     std::array<int, kDeviceCount> submissions_by_device{};
+    int max_in_flight_submits = 0;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
+        max_in_flight_submits = state->max_in_flight_submits;
         ASSERT_EQ(static_cast<size_t>(kDeviceCount), state->submissions.size());
         for (const auto& submission : state->submissions) {
             ASSERT_GE(submission.device_id, 0);
@@ -192,7 +202,7 @@ TEST(FftsTransportE2ETest, ConcurrentExecuteSubmitsToEightDevices)
     }
 
     for (const auto count : submissions_by_device) { EXPECT_EQ(1, count); }
-    EXPECT_GT(state->max_in_flight_submits.load(std::memory_order_acquire), 1)
+    EXPECT_GT(max_in_flight_submits, 1)
         << "Execute calls were serialized before reaching submit";
 
     for (int device_id = 0; device_id < kDeviceCount; ++device_id) {
