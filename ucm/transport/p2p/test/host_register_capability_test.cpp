@@ -120,22 +120,6 @@ private:
     AclDeviceGuard acl_;
 };
 
-TEST_F(HostRegisterCapabilityTest, LegacyMappedHostRegisterIsSupported)
-{
-    auto host = AllocatePageAlignedHostBuffer();
-    ASSERT_NE(nullptr, host.get());
-
-    void* device_ptr = nullptr;
-    const auto ret =
-        aclrtHostRegister(host.get(), kBufferSize, ACL_HOST_REGISTER_MAPPED, &device_ptr);
-    ASSERT_EQ(ACL_SUCCESS, ret)
-        << "aclrtHostRegister is not supported or failed on soc=" << CurrentSocVersion()
-        << ", ret=" << static_cast<int>(ret) << "(" << AclErrorHint(ret) << ")";
-
-    EXPECT_NE(nullptr, device_ptr);
-    EXPECT_EQ(ACL_SUCCESS, aclrtHostUnregister(host.get()));
-}
-
 TEST_F(HostRegisterCapabilityTest, MappedHostRegisterV2IsSupported)
 {
     auto host = AllocatePageAlignedHostBuffer();

@@ -26,6 +26,7 @@ public:
         std::function<Status(int, uint16_t)> init;
         std::function<Status(int)> shutdown;
         std::function<Status(int, void*, size_t, FftsMemoryRegistration&)> register_host;
+        std::function<Status(int, void*, size_t, FftsMemoryRegistration&)> map_host;
         std::function<Status(int, const FftsMemoryRegistration&)> unregister_host;
         std::function<Status(int, void*, size_t, FftsMemoryRegistration&)> register_device;
         std::function<Status(int, const FftsMemoryRegistration&)> unregister_device;

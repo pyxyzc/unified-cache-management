@@ -131,6 +131,20 @@ struct FftsTransport::Impl {
                                  : engine->RegisterHostMemory(host, size, registration);
     }
 
+    Status MapHostOnEngine(int device_id, void* host, size_t size,
+                           FftsMemoryRegistration& registration)
+    {
+#ifdef TRANSPORT_P2P_ENABLE_FFTS_TESTING
+        if (hooks.init) {
+            return hooks.map_host ? hooks.map_host(device_id, host, size, registration)
+                                  : Status::Failed;
+        }
+#endif
+        auto* engine = FindEngine(device_id);
+        return engine == nullptr ? Status::Failed
+                                 : engine->MapRegisteredHostMemory(host, size, registration);
+    }
+
     Status UnregisterHostOnEngine(int device_id, const FftsMemoryRegistration& registration)
     {
 #ifdef TRANSPORT_P2P_ENABLE_FFTS_TESTING
@@ -297,15 +311,28 @@ struct FftsTransport::Impl {
 
     Status RegisterHostMemory(const MemoryRegion& memory, MemoryRecord& record)
     {
-        for (const auto device_id : device_ids) {
+        if (device_ids.empty()) { return Status::Failed; }
+
+        const auto owner_device_id = device_ids.front();
+        if (!HasEngine(owner_device_id)) { return Status::Failed; }
+
+        FftsMemoryRegistration owner_registration;
+        auto status = RegisterHostOnEngine(owner_device_id, memory.addr,
+                                           static_cast<size_t>(memory.length),
+                                           owner_registration);
+        if (status != Status::Ok) { return status; }
+        record.registrations.emplace(owner_device_id, owner_registration);
+
+        for (size_t i = 1; i < device_ids.size(); ++i) {
+            const auto device_id = device_ids[i];
             if (!HasEngine(device_id)) {
                 (void)UnregisterRecord(record);
                 return Status::Failed;
             }
 
             FftsMemoryRegistration registration;
-            const auto status = RegisterHostOnEngine(
-                device_id, memory.addr, static_cast<size_t>(memory.length), registration);
+            status = MapHostOnEngine(device_id, memory.addr,
+                                     static_cast<size_t>(memory.length), registration);
             if (status != Status::Ok) {
                 (void)UnregisterRecord(record);
                 return status;

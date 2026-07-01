@@ -34,6 +34,8 @@ public:
     Status Init(const FftsEngineOptions& options);
     Status Shutdown();
     Status RegisterHostMemory(void* host, size_t size, FftsMemoryRegistration& registration);
+    Status MapRegisteredHostMemory(void* host, size_t size,
+                                   FftsMemoryRegistration& registration);
     Status UnregisterHostMemory(const FftsMemoryRegistration& registration);
     Status RegisterDeviceMemory(void* device, size_t size, FftsMemoryRegistration& registration);
     Status UnregisterDeviceMemory(const FftsMemoryRegistration& registration);

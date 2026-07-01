@@ -29,138 +29,50 @@ public:
     DeviceContext(const DeviceContext&) = delete;
     DeviceContext& operator=(const DeviceContext&) = delete;
 
-    Status Init(int device_id)
+    bool IsInitialized() const noexcept { return initialized_; }
+    int DeviceId() const noexcept { return device_id_; }
+    aclrtStream Stream() const noexcept { return stream_; }
+
+    void MarkInitialized(int device_id, aclrtStream stream) noexcept
     {
-        if (device_id < 0) { return Status::InvalidArgument; }
-        if (initialized_) { return Status::Ok; }
-
-        return RunOnDevice(device_id, [this, device_id]() {
-            auto status = AclStatus(aclrtCreateStream(&stream_), "aclrtCreateStream(ffts)");
-            if (status != Status::Ok) { return status; }
-
-            device_id_ = device_id;
-            initialized_ = true;
-            return Status::Ok;
-        });
+        device_id_ = device_id;
+        stream_ = stream;
+        initialized_ = true;
     }
 
-    Status Shutdown()
+    void Reset() noexcept
     {
-        Status result = Status::Ok;
-        if (stream_ != nullptr) {
-            bool ran_on_device = false;
-            const auto status = RunOnDevice(device_id_, [this, &ran_on_device]() {
-                ran_on_device = true;
-                const auto destroy_status =
-                    AclStatus(aclrtDestroyStream(stream_), "aclrtDestroyStream(ffts)");
-                stream_ = nullptr;
-                return destroy_status;
-            });
-            if (!ran_on_device) { return status; }
-            if (status != Status::Ok) { result = status; }
-        }
+        stream_ = nullptr;
         device_id_ = -1;
         initialized_ = false;
-        return result;
     }
-
-    Status RegisterHostMemory(void* host, size_t size, FftsMemoryRegistration& registration)
-    {
-        registration = {};
-        if (host == nullptr || size == 0) { return Status::InvalidArgument; }
-        if (!initialized_) { return Status::Failed; }
-
-        return RunOnDevice(device_id_, [host, size, &registration]() {
-            void* device = nullptr;
-            auto ret = aclrtHostRegisterV2(host, size, ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED);
-            if (ret != ACL_SUCCESS) {
-                UC_ERROR("FFTS failed to register host memory addr=0x{:x} size={} ret={}",
-                         PtrToU64(host), size, static_cast<int32_t>(ret));
-                return Status::Failed;
-            }
-
-            ret = aclrtHostGetDevicePointer(host, &device, 0);
-            if (ret != ACL_SUCCESS) {
-                UC_ERROR("FFTS failed to get mapped device pointer addr=0x{:x} size={} ret={}",
-                         PtrToU64(host), size, static_cast<int32_t>(ret));
-                (void)aclrtHostUnregister(host);
-                return Status::Failed;
-            }
-
-            if (device == nullptr) {
-                UC_ERROR("FFTS host registration returned null device pointer addr=0x{:x} "
-                         "size={}",
-                         PtrToU64(host), size);
-                (void)aclrtHostUnregister(host);
-                return Status::Failed;
-            }
-
-            registration.origin_addr = host;
-            registration.ffts_addr = device;
-            registration.size = size;
-            registration.requires_unregister = true;
-            return Status::Ok;
-        });
-    }
-
-    Status UnregisterHostMemory(const FftsMemoryRegistration& registration)
-    {
-        if (!registration.requires_unregister) { return Status::Ok; }
-        if (registration.origin_addr == nullptr || registration.size == 0) {
-            return Status::InvalidArgument;
-        }
-        if (!initialized_) { return Status::Failed; }
-
-        return RunOnDevice(device_id_, [&registration]() {
-            return AclStatus(aclrtHostUnregister(registration.origin_addr),
-                             "aclrtHostUnregister(ffts)");
-        });
-    }
-
-    Status RegisterDeviceMemory(void* device, size_t size,
-                                FftsMemoryRegistration& registration) const
-    {
-        registration = {};
-        if (device == nullptr || size == 0) { return Status::InvalidArgument; }
-
-        registration.origin_addr = device;
-        registration.ffts_addr = device;
-        registration.size = size;
-        registration.requires_unregister = false;
-        return Status::Ok;
-    }
-
-    Status UnregisterDeviceMemory(const FftsMemoryRegistration& registration) const
-    {
-        (void)registration;
-        return Status::Ok;
-    }
-
-    Status Synchronize()
-    {
-        if (!initialized_ || stream_ == nullptr) { return Status::Failed; }
-
-        return RunOnDevice(device_id_, [this]() { return SynchronizeOnCurrentDevice(); });
-    }
-
-    Status Submit(const std::vector<FftsCopySpec>& copies, uint16_t max_ready_lanes)
-    {
-        if (!initialized_ || stream_ == nullptr) { return Status::Failed; }
-
-        return RunOnDevice(device_id_, [this, &copies, max_ready_lanes]() {
-            FftsDispatcher dispatcher;
-            auto status = dispatcher.BuildCopies(copies, max_ready_lanes);
-            if (status != Status::Ok) { return status; }
-
-            status = dispatcher.Launch(stream_);
-            if (status != Status::Ok) { return status; }
-            return SynchronizeOnCurrentDevice();
-        });
-    }
-
-    bool IsInitialized() const noexcept { return initialized_; }
 
 private:
+    aclrtStream stream_ = nullptr;
+    int device_id_ = -1;
+    bool initialized_ = false;
+};
+
+}  // namespace
+
+struct FftsEngine::Impl {
+    std::mutex mutex;
+    DeviceContext device_context;
+    uint16_t max_ready_lanes = 8;
+
+    template <typename Fn>
+    Status RunOnDevice(int device_id, Fn&& fn)
+    {
+        int32_t previous_device = -1;
+        bool should_restore = false;
+        const auto enter_status = EnterDevice(device_id, previous_device, should_restore);
+        if (enter_status != Status::Ok) { return enter_status; }
+
+        const auto status = std::forward<Fn>(fn)();
+        RestoreDevice(previous_device, should_restore);
+        return status;
+    }
+
     Status EnterDevice(int device_id, int32_t& previous_device, bool& should_restore)
     {
         previous_device = -1;
@@ -194,35 +106,35 @@ private:
         }
     }
 
-    template <typename Fn>
-    Status RunOnDevice(int device_id, Fn&& fn)
+    Status MapHostOnCurrentDevice(void* host, size_t size, bool requires_unregister,
+                                  FftsMemoryRegistration& registration)
     {
-        int32_t previous_device = -1;
-        bool should_restore = false;
-        const auto enter_status = EnterDevice(device_id, previous_device, should_restore);
-        if (enter_status != Status::Ok) { return enter_status; }
+        void* device = nullptr;
+        const auto ret = aclrtHostGetDevicePointer(host, &device, 0);
+        if (ret != ACL_SUCCESS) {
+            UC_ERROR("FFTS failed to get mapped device pointer addr=0x{:x} size={} ret={}",
+                     PtrToU64(host), size, static_cast<int32_t>(ret));
+            return Status::Failed;
+        }
 
-        const auto status = std::forward<Fn>(fn)();
-        RestoreDevice(previous_device, should_restore);
-        return status;
+        if (device == nullptr) {
+            UC_ERROR("FFTS host registration returned null device pointer addr=0x{:x} size={}",
+                     PtrToU64(host), size);
+            return Status::Failed;
+        }
+
+        registration.origin_addr = host;
+        registration.ffts_addr = device;
+        registration.size = size;
+        registration.requires_unregister = requires_unregister;
+        return Status::Ok;
     }
 
     Status SynchronizeOnCurrentDevice()
     {
-        return AclStatus(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream(ffts)");
+        return AclStatus(aclrtSynchronizeStream(device_context.Stream()),
+                         "aclrtSynchronizeStream(ffts)");
     }
-
-    aclrtStream stream_ = nullptr;
-    int device_id_ = -1;
-    bool initialized_ = false;
-};
-
-}  // namespace
-
-struct FftsEngine::Impl {
-    std::mutex mutex;
-    DeviceContext device_context;
-    uint16_t max_ready_lanes = 8;
 };
 
 FftsEngine::FftsEngine() : impl_(std::make_unique<Impl>()) {}
@@ -255,9 +167,13 @@ Status FftsEngine::Init(const FftsEngineOptions& options)
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->device_context.IsInitialized()) { return Status::Ok; }
 
-    auto status = impl_->device_context.Init(options.device_id);
+    aclrtStream stream = nullptr;
+    auto status = impl_->RunOnDevice(options.device_id, [&stream]() {
+        return AclStatus(aclrtCreateStream(&stream), "aclrtCreateStream(ffts)");
+    });
     if (status != Status::Ok) { return status; }
 
+    impl_->device_context.MarkInitialized(options.device_id, stream);
     impl_->max_ready_lanes = options.max_ready_lanes;
     return Status::Ok;
 }
@@ -265,7 +181,21 @@ Status FftsEngine::Init(const FftsEngineOptions& options)
 Status FftsEngine::Shutdown()
 {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    const auto status = impl_->device_context.Shutdown();
+
+    Status status = Status::Ok;
+    if (impl_->device_context.Stream() != nullptr) {
+        bool ran_on_device = false;
+        status = impl_->RunOnDevice(impl_->device_context.DeviceId(),
+                                    [this, &ran_on_device]() {
+                                        ran_on_device = true;
+                                        return AclStatus(
+                                            aclrtDestroyStream(impl_->device_context.Stream()),
+                                            "aclrtDestroyStream(ffts)");
+                                    });
+        if (!ran_on_device) { return status; }
+    }
+
+    impl_->device_context.Reset();
     impl_->max_ready_lanes = 8;
     return status;
 }
@@ -273,37 +203,113 @@ Status FftsEngine::Shutdown()
 Status FftsEngine::RegisterHostMemory(void* host, size_t size,
                                       FftsMemoryRegistration& registration)
 {
+    registration = {};
+    if (host == nullptr || size == 0) { return Status::InvalidArgument; }
+
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    return impl_->device_context.RegisterHostMemory(host, size, registration);
+    if (!impl_->device_context.IsInitialized()) { return Status::Failed; }
+
+    return impl_->RunOnDevice(impl_->device_context.DeviceId(),
+                              [this, host, size, &registration]() {
+                                  auto ret = aclrtHostRegisterV2(
+                                      host, size,
+                                      ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED);
+                                  if (ret != ACL_SUCCESS) {
+                                      UC_ERROR("FFTS failed to register host memory addr=0x{:x} "
+                                               "size={} ret={}",
+                                               PtrToU64(host), size,
+                                               static_cast<int32_t>(ret));
+                                      return Status::Failed;
+                                  }
+
+                                  const auto status = impl_->MapHostOnCurrentDevice(
+                                      host, size, true, registration);
+                                  if (status != Status::Ok) {
+                                      (void)aclrtHostUnregister(host);
+                                      registration = {};
+                                  }
+                                  return status;
+                              });
+}
+
+Status FftsEngine::MapRegisteredHostMemory(void* host, size_t size,
+                                           FftsMemoryRegistration& registration)
+{
+    registration = {};
+    if (host == nullptr || size == 0) { return Status::InvalidArgument; }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->device_context.IsInitialized()) { return Status::Failed; }
+
+    return impl_->RunOnDevice(impl_->device_context.DeviceId(),
+                              [this, host, size, &registration]() {
+                                  return impl_->MapHostOnCurrentDevice(host, size, false,
+                                                                       registration);
+                              });
 }
 
 Status FftsEngine::UnregisterHostMemory(const FftsMemoryRegistration& registration)
 {
+    if (!registration.requires_unregister) { return Status::Ok; }
+    if (registration.origin_addr == nullptr || registration.size == 0) {
+        return Status::InvalidArgument;
+    }
+
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    return impl_->device_context.UnregisterHostMemory(registration);
+    if (!impl_->device_context.IsInitialized()) { return Status::Failed; }
+
+    return impl_->RunOnDevice(impl_->device_context.DeviceId(), [&registration]() {
+        return AclStatus(aclrtHostUnregister(registration.origin_addr),
+                         "aclrtHostUnregister(ffts)");
+    });
 }
 
 Status FftsEngine::RegisterDeviceMemory(void* device, size_t size,
                                         FftsMemoryRegistration& registration)
 {
-    return impl_->device_context.RegisterDeviceMemory(device, size, registration);
+    registration = {};
+    if (device == nullptr || size == 0) { return Status::InvalidArgument; }
+
+    registration.origin_addr = device;
+    registration.ffts_addr = device;
+    registration.size = size;
+    registration.requires_unregister = false;
+    return Status::Ok;
 }
 
 Status FftsEngine::UnregisterDeviceMemory(const FftsMemoryRegistration& registration)
 {
-    return impl_->device_context.UnregisterDeviceMemory(registration);
+    (void)registration;
+    return Status::Ok;
 }
 
 Status FftsEngine::Submit(const std::vector<FftsCopySpec>& copies)
 {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    return impl_->device_context.Submit(copies, impl_->max_ready_lanes);
+    if (!impl_->device_context.IsInitialized() || impl_->device_context.Stream() == nullptr) {
+        return Status::Failed;
+    }
+
+    return impl_->RunOnDevice(impl_->device_context.DeviceId(), [this, &copies]() {
+        FftsDispatcher dispatcher;
+        auto status = dispatcher.BuildCopies(copies, impl_->max_ready_lanes);
+        if (status != Status::Ok) { return status; }
+
+        status = dispatcher.Launch(impl_->device_context.Stream());
+        if (status != Status::Ok) { return status; }
+        return impl_->SynchronizeOnCurrentDevice();
+    });
 }
 
 Status FftsEngine::Synchronize()
 {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    return impl_->device_context.Synchronize();
+    if (!impl_->device_context.IsInitialized() || impl_->device_context.Stream() == nullptr) {
+        return Status::Failed;
+    }
+
+    return impl_->RunOnDevice(impl_->device_context.DeviceId(),
+                              [this]() { return impl_->SynchronizeOnCurrentDevice(); });
 }
 
 }  // namespace transport
