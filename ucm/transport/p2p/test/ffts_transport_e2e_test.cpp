@@ -2,8 +2,10 @@
 #include <acl/acl.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -56,6 +58,58 @@ uint64_t PtrToU64(const void* ptr)
 {
     return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr));
 }
+
+class PhaseTimings {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    ~PhaseTimings() { Print(); }
+
+    void Start(const char* name)
+    {
+        Stop();
+        current_name_ = name;
+        current_start_ = Clock::now();
+        running_ = true;
+    }
+
+    void Stop()
+    {
+        if (!running_) { return; }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            Clock::now() - current_start_);
+        records_.push_back(Record{current_name_, elapsed.count()});
+        running_ = false;
+    }
+
+    void Print()
+    {
+        Stop();
+        if (printed_) { return; }
+        printed_ = true;
+
+        int64_t total_us = 0;
+        std::cerr << "[FftsTransportE2ETest] phase_timings";
+        for (const auto& record : records_) {
+            total_us += record.elapsed_us;
+            std::cerr << " " << record.name << "="
+                      << static_cast<double>(record.elapsed_us) / 1000.0 << "ms";
+        }
+        std::cerr << " total=" << static_cast<double>(total_us) / 1000.0 << "ms\n";
+    }
+
+private:
+    struct Record {
+        const char* name = "";
+        int64_t elapsed_us = 0;
+    };
+
+    std::vector<Record> records_;
+    Clock::time_point current_start_;
+    const char* current_name_ = "";
+    bool running_ = false;
+    bool printed_ = false;
+};
 
 ::testing::AssertionResult SetDevice(int device_id)
 {
@@ -254,6 +308,9 @@ protected:
 
 TEST_F(FftsTransportE2ETest, ConcurrentDeviceToDeviceCopiesMoveBytesOnEightDevices)
 {
+    PhaseTimings timings;
+
+    timings.Start("capability_check");
     uint32_t available_devices = 0;
     ASSERT_EQ(aclrtGetDeviceCount(&available_devices), ACL_SUCCESS);
     if (available_devices < static_cast<uint32_t>(kDeviceCount)) {
@@ -269,6 +326,7 @@ TEST_F(FftsTransportE2ETest, ConcurrentDeviceToDeviceCopiesMoveBytesOnEightDevic
         device_ids.push_back(device_id);
     }
 
+    timings.Start("allocate_and_seed");
     std::array<DeviceAllocation, kDeviceCount> src_devices;
     std::array<DeviceAllocation, kDeviceCount> dst_devices;
     std::array<std::vector<std::uint8_t>, kDeviceCount> expected;
@@ -282,12 +340,14 @@ TEST_F(FftsTransportE2ETest, ConcurrentDeviceToDeviceCopiesMoveBytesOnEightDevic
         ASSERT_TRUE(ZeroDevice(device_id, dst_devices[index].Get(), kCopySize));
     }
 
+    timings.Start("transport_init");
     FftsTransport transport;
     FftsInitAttrs attrs;
     attrs.device_ids = device_ids;
     attrs.max_ready_lanes = kMaxReadyLanes;
     ASSERT_EQ(Status::Ok, transport.Init(attrs));
 
+    timings.Start("register_memory");
     std::array<MemoryHandle, kDeviceCount> src_handles{};
     std::array<MemoryHandle, kDeviceCount> dst_handles{};
     std::fill(src_handles.begin(), src_handles.end(), kInvalidMemoryHandle);
@@ -301,6 +361,7 @@ TEST_F(FftsTransportE2ETest, ConcurrentDeviceToDeviceCopiesMoveBytesOnEightDevic
                                          kCopySize, dst_handles[index]));
     }
 
+    timings.Start("execute_threads");
     std::array<Status, kDeviceCount> results{};
     results.fill(Status::Failed);
     std::vector<std::thread> workers;
@@ -325,15 +386,19 @@ TEST_F(FftsTransportE2ETest, ConcurrentDeviceToDeviceCopiesMoveBytesOnEightDevic
             << ", status=" << StatusName(results[index]);
     }
 
+    timings.Start("verify");
     for (int index = 0; index < kDeviceCount; ++index) {
         EXPECT_TRUE(DeviceEquals(device_ids[index], dst_devices[index].Get(), expected[index]));
     }
 
+    timings.Start("unregister_shutdown");
     for (int index = 0; index < kDeviceCount; ++index) {
         EXPECT_EQ(Status::Ok, transport.UnregisterMemory(dst_handles[index]));
         EXPECT_EQ(Status::Ok, transport.UnregisterMemory(src_handles[index]));
     }
     EXPECT_EQ(Status::Ok, transport.Shutdown());
+    timings.Stop();
+    timings.Print();
 }
 
 }  // namespace
