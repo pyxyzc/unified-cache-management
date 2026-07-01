@@ -5,6 +5,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -80,7 +81,7 @@ struct FftsTransport::Impl {
         uint64_t offset = 0;
     };
 
-    std::mutex mutex;
+    std::shared_mutex mutex;
     std::unordered_map<int, std::unique_ptr<FftsEngine>> engines;
     std::vector<int> device_ids;
     std::unordered_map<MemoryHandle, MemoryRecord> memories;
@@ -348,7 +349,7 @@ Status FftsTransport::Init(const InitAttrs& options)
     auto* attrs = dynamic_cast<const FftsInitAttrs*>(&options);
     if (attrs == nullptr || attrs->max_ready_lanes == 0) { return Status::InvalidArgument; }
 
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     if (impl_->initialized) { return Status::Ok; }
 
     std::vector<int> device_ids;
@@ -383,7 +384,7 @@ Status FftsTransport::Init(const InitAttrs& options)
 
 Status FftsTransport::Shutdown()
 {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::unique_lock<std::shared_mutex> lock(impl_->mutex);
 
     Status result = Status::Ok;
     for (const auto& item : impl_->memories) {
@@ -408,7 +409,7 @@ Status FftsTransport::RegisterMemory(const MemoryRegion& memory, MemoryHandle& h
     handle = kInvalidMemoryHandle;
     if (memory.addr == nullptr || memory.length == 0) { return Status::InvalidArgument; }
 
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     if (!impl_->initialized) { return Status::Failed; }
 
     for (const auto& item : impl_->memories) {
@@ -443,7 +444,7 @@ Status FftsTransport::UnregisterMemory(MemoryHandle handle)
 {
     if (handle == kInvalidMemoryHandle) { return Status::InvalidArgument; }
 
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto it = impl_->memories.find(handle);
     if (it == impl_->memories.end()) { return Status::Failed; }
 
@@ -456,9 +457,6 @@ Status FftsTransport::UnregisterMemory(MemoryHandle handle)
 Status FftsTransport::ExportMetadata(const ManagerID& manager_id, Metadata& out)
 {
     (void)manager_id;
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (!impl_->initialized) { return Status::Failed; }
-
     out.clear();
     return detail::AppendU32(out, kMetadataVersion) ? Status::Ok : Status::InvalidArgument;
 }
@@ -483,7 +481,7 @@ Status FftsTransport::Execute(const Operation& request)
         return Status::InvalidArgument;
     }
 
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::shared_lock<std::shared_mutex> lock(impl_->mutex);
     if (!impl_->initialized) { return Status::Failed; }
 
     std::unordered_map<int, std::vector<FftsCopySpec>> copies_by_device;
