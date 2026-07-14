@@ -71,6 +71,14 @@ TEST_F(BufferManagerTest, InitWithZeroSlotNum)
     ASSERT_EQ(status.code, StatusCode::INVALID_ARGUMENT);
 }
 
+TEST_F(BufferManagerTest, InitWithUnsupportedMemoryType)
+{
+    BufferManager mgr;
+    auto status = mgr.Init("test_buffer", static_cast<MemoryType>(99), 1024, 1);
+    ASSERT_FALSE(status.ok());
+    ASSERT_EQ(status.code, StatusCode::INVALID_ARGUMENT);
+}
+
 TEST_F(BufferManagerTest, InitHostWithUnalignedSlotCapacity)
 {
     BufferManager mgr;
@@ -533,6 +541,11 @@ TEST_F(BufferManagerTest, InitWithProviderRegisterFails)
     ASSERT_FALSE(status.ok());
     ASSERT_EQ(status.code, StatusCode::INTERNAL_ERROR);
     ASSERT_EQ(provider.unregisterCount, 0);
+
+    provider.failRegister = false;
+    status = mgr.Init("test_rdma_retry", MemoryType::HOST, 1024, 10, &provider);
+    ASSERT_TRUE(status.ok()) << status.message;
+    ASSERT_EQ(provider.registerCount, 2);
 }
 
 TEST_F(BufferManagerTest, InitWithProviderGetTokenFailsCleansUp)
@@ -545,6 +558,11 @@ TEST_F(BufferManagerTest, InitWithProviderGetTokenFailsCleansUp)
     ASSERT_FALSE(status.ok());
     ASSERT_EQ(status.code, StatusCode::INTERNAL_ERROR);
     ASSERT_EQ(provider.unregisterCount, 1);
+
+    provider.failGetToken = false;
+    status = mgr.Init("test_rdma_retry", MemoryType::HOST, 1024, 10, &provider);
+    ASSERT_TRUE(status.ok()) << status.message;
+    ASSERT_EQ(provider.registerCount, 2);
 }
 
 }  // namespace

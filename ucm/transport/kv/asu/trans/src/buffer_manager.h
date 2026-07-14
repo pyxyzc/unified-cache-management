@@ -25,10 +25,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include "asu_transport/types.h"
-#include "thread/index_pool.h"
+#include "pool/buffer_pool.h"
 #include "trans_provider.h"
 
 namespace UC::ASU {
@@ -66,27 +65,10 @@ public:
     std::uint32_t GetTokenId() const { return tokenId_; }
 
 private:
-    struct BufferRegion {
-        static Status Create(MemoryType type, std::size_t size, BufferRegion& region);
-
-        explicit operator bool() const { return owner != nullptr; }
-        void Reset();
-
-        std::shared_ptr<void> owner;
-        void* localAddr{nullptr};
-        void* deviceAddr{nullptr};
-        TransProvider::MemType providerMemType{TransProvider::MemType::MEM_HOST};
-    };
-
     Status RegisterMemory();
-    std::string name_;
-    std::size_t slot_capacity_{0};
-    std::size_t slot_stride_{0};
-    std::size_t slot_num_{0};
-    MemoryType memory_type_{MemoryType::HOST};
 
-    BufferRegion region_;
-    IndexPool index_pool_;
+    UC::BufferPool bufferPool_;
+    MemoryType memoryType_{MemoryType::HOST};
 
     TransProvider* provider_{nullptr};
     TransProvider::MemHandle memHandle_{nullptr};

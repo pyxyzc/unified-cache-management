@@ -51,13 +51,7 @@ target_link_libraries(asu_ascend_deps INTERFACE ${ASU_ASCENDCL_LIB})
 
 file(GLOB ASU_COMMON_SOURCES CONFIGURE_DEPENDS common/*.cpp)
 file(GLOB ASU_TRANSPORT_SOURCES CONFIGURE_DEPENDS trans/src/*.cpp)
-file(GLOB LOGGER_SOURCES CONFIGURE_DEPENDS 
-    ${UCM_ROOT_DIR}/ucm/shared/infra/logger/*.cc
-    ${UCM_ROOT_DIR}/ucm/shared/infra/logger/cc/*.cc
-)
 list(APPEND ASU_TRANSPORT_SOURCES ${ASU_COMMON_SOURCES})
-list(APPEND ASU_TRANSPORT_SOURCES ${LOGGER_SOURCES})
-list(APPEND ASU_TRANSPORT_SOURCES ${UCM_ROOT_DIR}/ucm/shared/trans/ascend/ascend_buffer.cc)
 add_library(asu_transport SHARED ${ASU_TRANSPORT_SOURCES})
 target_include_directories(asu_transport
     PUBLIC
@@ -66,8 +60,6 @@ target_include_directories(asu_transport
         ${CMAKE_CURRENT_SOURCE_DIR}/common
         ${CMAKE_CURRENT_SOURCE_DIR}/trans/src
         ${UCM_ROOT_DIR}/ucm/shared/infra
-        ${UCM_ROOT_DIR}/ucm/shared/infra/logger
-        ${UCM_ROOT_DIR}/ucm/shared/infra/logger/cc
         ${UCM_ROOT_DIR}/ucm/shared/infra/status
         ${UCM_ROOT_DIR}/ucm/shared
 )
@@ -77,6 +69,8 @@ target_link_libraries(asu_transport
         pthread fmt spdlog zlibstatic
     PRIVATE
         asu_ascend_deps
+        buffer_pool
+        infra_logger
 )
 
 if(BUILD_UCM_ASU_PROVIDER_AICPU)

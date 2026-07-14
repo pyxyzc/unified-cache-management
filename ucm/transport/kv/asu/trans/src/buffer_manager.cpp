@@ -22,76 +22,43 @@
  * SOFTWARE.
  * */
 #include "buffer_manager.h"
-#include <acl/acl.h>
-#include <cstdlib>
-#include <cstring>
-#include <limits>
-#include "trans/ascend/ascend_buffer.h"
+#include <utility>
+#include <vector>
 
 namespace UC::ASU {
+namespace {
 
-constexpr std::size_t kSlotAddressAlignment = 64;
-
-bool GetSlotStride(std::size_t capacity, std::size_t& stride)
+Status ConvertPoolStatus(const UC::Status& status)
 {
-    // NOTE: Ascend ACL documents an aclrtMallocHost large-block suballocation
-    // layout of ALIGN_UP(len, 32) + 32 bytes with 64-byte-aligned segment
-    // starts. Current HCOMM/RDMA validation did not reproduce failures without
-    // the extra 32-byte tail room, so ASU keeps only the 64-byte slot-start
-    // alignment for now.
-    // Keep one layout for every memory type by aligning each slot start to a
-    // 64-byte boundary.
-    constexpr auto kMaxSize = std::numeric_limits<std::size_t>::max();
-    if (capacity > kMaxSize - (kSlotAddressAlignment - 1)) { return false; }
+    if (status.Success()) { return Status::OK(); }
 
-    stride = (capacity + kSlotAddressAlignment - 1) / kSlotAddressAlignment * kSlotAddressAlignment;
-    return true;
+    StatusCode code = StatusCode::INTERNAL_ERROR;
+    if (status == UC::Status::InvalidParam()) {
+        code = StatusCode::INVALID_ARGUMENT;
+    } else if (status == UC::Status::Retry()) {
+        code = StatusCode::RESOURCE_BUSY;
+    }
+    return Status::Error(code, status.ToString());
 }
 
-Status BufferManager::BufferRegion::Create(MemoryType type, std::size_t size, BufferRegion& region)
+Status ConvertMemoryType(MemoryType type, UC::BufferPool::MemoryType& poolType)
 {
-    Trans::AscendBuffer ascendBuffer;
     switch (type) {
-        case MemoryType::HOST: {
-            auto owner = ascendBuffer.MakeHostBuffer(size);
-            if (!owner) {
-                return Status::Error(StatusCode::INTERNAL_ERROR, "failed to allocate host memory");
-            }
-            // HOST has one CPU-visible address, which is also passed to the
-            // provider when it registers the region as MEM_HOST.
-            region = {owner, owner.get(), owner.get(), TransProvider::MemType::MEM_HOST};
+        case MemoryType::HOST:
+            poolType = UC::BufferPool::MemoryType::HOST;
             return Status::OK();
-        }
-        case MemoryType::HOST_PINNED: {
-            void* deviceAddr = nullptr;
-            auto owner = ascendBuffer.MakeHostPinnedBuffer(size, &deviceAddr);
-            if (!owner) {
-                return Status::Error(StatusCode::INTERNAL_ERROR,
-                                     "failed to allocate host-pinned memory");
-            }
-            region = {owner, owner.get(), deviceAddr, TransProvider::MemType::MEM_DEVICE};
+        case MemoryType::HOST_PINNED:
+            poolType = UC::BufferPool::MemoryType::HOST_PINNED;
             return Status::OK();
-        }
-        case MemoryType::ASCEND_DEVICE: {
-            auto owner = ascendBuffer.MakeDeviceBuffer(size);
-            if (!owner) {
-                return Status::Error(StatusCode::INTERNAL_ERROR,
-                                     "failed to allocate device memory");
-            }
-            region = {owner, owner.get(), owner.get(), TransProvider::MemType::MEM_DEVICE};
+        case MemoryType::ASCEND_DEVICE:
+            poolType = UC::BufferPool::MemoryType::ASCEND_DEVICE;
             return Status::OK();
-        }
-        default: return Status::Error(StatusCode::INVALID_ARGUMENT, "unsupported memory type");
+        default:
+            return Status::Error(StatusCode::INVALID_ARGUMENT, "unsupported memory type");
     }
 }
 
-void BufferManager::BufferRegion::Reset()
-{
-    owner.reset();
-    localAddr = nullptr;
-    deviceAddr = nullptr;
-    providerMemType = TransProvider::MemType::MEM_HOST;
-}
+}  // namespace
 
 bool IsTransportBufferReady(const ScatterGatherEntry& sge)
 {
@@ -107,57 +74,33 @@ BufferManager::~BufferManager()
         };
         provider_->UnregisterMemory(descs);
     }
-    region_.Reset();
-    slot_capacity_ = 0;
-    slot_stride_ = 0;
-    slot_num_ = 0;
+    memHandle_ = nullptr;
+    provider_ = nullptr;
+    tokenId_ = 0;
+    bufferPool_.Reset();
+    memoryType_ = MemoryType::HOST;
 }
 
 Status BufferManager::Init(std::string name, MemoryType type, std::size_t slot_capacity,
                            std::size_t slot_num, TransProvider* provider)
 {
-    if (region_) {
-        return Status::Error(StatusCode::INVALID_ARGUMENT, name + " already initialized");
-    }
-    if (slot_capacity == 0 || slot_num == 0) {
-        return Status::Error(StatusCode::INVALID_ARGUMENT,
-                             name + ": slot_capacity and slot_num must be non-zero");
-    }
-    std::size_t slotStride = 0;
-    if (!GetSlotStride(slot_capacity, slotStride) ||
-        slot_num > std::numeric_limits<std::size_t>::max() / slotStride) {
-        return Status::Error(StatusCode::INVALID_ARGUMENT, name + ": slot layout size overflow");
-    }
+    UC::BufferPool::MemoryType poolType;
+    auto typeStatus = ConvertMemoryType(type, poolType);
+    if (!typeStatus.ok()) { return typeStatus; }
 
-    name_ = std::move(name);
-    memory_type_ = type;
-    slot_capacity_ = slot_capacity;
-    slot_stride_ = slotStride;
-    slot_num_ = slot_num;
-
-    std::size_t total = slot_stride_ * slot_num_;
-
-    auto allocStatus = BufferRegion::Create(memory_type_, total, region_);
-    if (!allocStatus.ok()) { return allocStatus; }
-
-    if (memory_type_ == MemoryType::ASCEND_DEVICE) {
-        if (aclrtMemset(region_.localAddr, total, 0, total) != ACL_SUCCESS) {
-            region_.Reset();
-            return Status::Error(StatusCode::INTERNAL_ERROR,
-                                 name_ + ": failed to zero device memory");
-        }
-    } else {
-        std::memset(region_.localAddr, 0, total);
-    }
-
-    index_pool_.Setup(static_cast<IndexPool::Index>(slot_num));
+    auto poolStatus = bufferPool_.Init(std::move(name), poolType, slot_capacity, slot_num);
+    if (poolStatus.Failure()) { return ConvertPoolStatus(poolStatus); }
+    memoryType_ = type;
 
     if (provider) {
         provider_ = provider;
         auto regStatus = RegisterMemory();
         if (!regStatus.ok()) {
             provider_ = nullptr;
-            region_.Reset();
+            memHandle_ = nullptr;
+            tokenId_ = 0;
+            bufferPool_.Reset();
+            memoryType_ = MemoryType::HOST;
             return regStatus;
         }
     }
@@ -167,16 +110,20 @@ Status BufferManager::Init(std::string name, MemoryType type, std::size_t slot_c
 
 Status BufferManager::RegisterMemory()
 {
-    std::size_t total = slot_stride_ * slot_num_;
+    const auto providerMemType = memoryType_ == MemoryType::HOST
+                                     ? TransProvider::MemType::MEM_HOST
+                                     : TransProvider::MemType::MEM_DEVICE;
     std::vector<TransProvider::RegisterMemoryDesc> descs{
-        {region_.providerMemType, reinterpret_cast<uintptr_t>(region_.deviceAddr), total,
-         reinterpret_cast<uintptr_t>(region_.localAddr)}
+        {providerMemType, reinterpret_cast<std::uintptr_t>(bufferPool_.GetDeviceAddr()),
+         bufferPool_.GetTotalSize(),
+         reinterpret_cast<std::uintptr_t>(bufferPool_.GetLocalAddr())}
     };
     std::vector<TransProvider::MemHandle> memHandles;
     auto regStatus = provider_->RegisterMemory(nullptr, descs, memHandles);
     if (!regStatus.ok() || memHandles.empty()) {
         return Status::Error(StatusCode::INTERNAL_ERROR,
-                             name_ + ": failed to register memory: " + regStatus.message);
+                             bufferPool_.GetName() +
+                                 ": failed to register memory: " + regStatus.message);
     }
 
     auto tokenStatus = provider_->GetMemTokenId(memHandles[0], tokenId_);
@@ -185,8 +132,10 @@ Status BufferManager::RegisterMemory()
             {nullptr, memHandles[0]}
         };
         provider_->UnregisterMemory(unregDescs);
+        tokenId_ = 0;
         return Status::Error(StatusCode::INTERNAL_ERROR,
-                             name_ + ": failed to get token id: " + tokenStatus.message);
+                             bufferPool_.GetName() +
+                                 ": failed to get token id: " + tokenStatus.message);
     }
 
     memHandle_ = memHandles[0];
@@ -195,57 +144,34 @@ Status BufferManager::RegisterMemory()
 
 Status BufferManager::Allocate(std::size_t size, ScatterGatherEntry& sge)
 {
-    if (!region_) { return Status::Error(StatusCode::NOT_INITIALIZED, name_ + " not initialized"); }
-    if (size == 0) {
-        return Status::Error(StatusCode::INVALID_ARGUMENT, name_ + ": size must be non-zero");
-    }
-    if (size > slot_capacity_) {
-        return Status::Error(StatusCode::INVALID_ARGUMENT, name_ + ": size exceeds slot_capacity");
+    if (!bufferPool_.IsInitialized()) {
+        return Status::Error(StatusCode::NOT_INITIALIZED, "buffer pool not initialized");
     }
 
-    auto idx = index_pool_.Acquire();
-    if (idx == IndexPool::npos) {
-        return Status::Error(StatusCode::RESOURCE_BUSY, name_ + ": no free slots");
-    }
-    const auto offset = idx * slot_stride_;
-    sge.local_addr =
-        reinterpret_cast<std::uint64_t>(static_cast<char*>(region_.localAddr) + offset);
-    sge.device_addr =
-        reinterpret_cast<std::uint64_t>(static_cast<char*>(region_.deviceAddr) + offset);
-    sge.length = static_cast<std::uint32_t>(size);
+    UC::BufferPool::Slot slot;
+    auto poolStatus = bufferPool_.Allocate(size, slot);
+    if (poolStatus.Failure()) { return ConvertPoolStatus(poolStatus); }
+
+    sge.local_addr = reinterpret_cast<std::uint64_t>(slot.local_addr);
+    sge.device_addr = reinterpret_cast<std::uint64_t>(slot.device_addr);
+    sge.length = static_cast<std::uint32_t>(slot.length);
     sge.tokenId = tokenId_;
-    sge.slot_index = idx;
-    sge.memory_type = memory_type_;
+    sge.slot_index = slot.slot_index;
+    sge.memory_type = memoryType_;
     return Status::OK();
 }
 
 Status BufferManager::Free(std::uint32_t slot_index)
 {
-    if (!region_) { return Status::Error(StatusCode::NOT_INITIALIZED, name_ + " not initialized"); }
-    if (slot_index >= slot_num_) {
-        return Status::Error(StatusCode::INVALID_ARGUMENT, name_ + ": slot_index out of range");
+    if (!bufferPool_.IsInitialized()) {
+        return Status::Error(StatusCode::NOT_INITIALIZED, "buffer pool not initialized");
     }
-    auto* p = static_cast<char*>(region_.localAddr) + slot_index * slot_stride_;
-    if (memory_type_ == MemoryType::ASCEND_DEVICE) {
-        if (aclrtMemset(p, slot_stride_, 0, slot_stride_) != ACL_SUCCESS) {
-            return Status::Error(StatusCode::INTERNAL_ERROR,
-                                 name_ + ": failed to zero device memory");
-        }
-    } else {
-        std::memset(p, 0, slot_stride_);
-    }
-    index_pool_.Release(static_cast<IndexPool::Index>(slot_index));
-    return Status::OK();
+    return ConvertPoolStatus(bufferPool_.Free(slot_index));
 }
 
 bool BufferManager::IsValidPointer(const void* ptr) const
 {
-    if (!ptr || !region_) { return false; }
-    auto* base = static_cast<const char*>(region_.localAddr);
-    auto* p = static_cast<const char*>(ptr);
-    if (p < base || p >= base + slot_stride_ * slot_num_) { return false; }
-    auto offset = static_cast<std::size_t>(p - base);
-    return (offset % slot_stride_) == 0;
+    return bufferPool_.IsValidPointer(ptr);
 }
 
 }  // namespace UC::ASU
