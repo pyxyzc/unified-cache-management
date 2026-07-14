@@ -147,6 +147,7 @@ if(BUILD_UNIT_TESTS)
     target_link_libraries(asu.test PRIVATE
         asu_client
         asu_ascend_deps
+        buffer_pool
         gtest_main gtest
     )
     gtest_discover_tests(asu.test)
