@@ -14,7 +14,7 @@ ucm_connectors:
   - ucm_connector_name: "UcmPipelineStore"
     ucm_connector_config:
       store_pipeline: "Cache|Posix"
-      storage_backends: "/mnt/test"
+      storage_backends: "/data/yp/kvcache"
       io_direct: false
       # cache_buffer_capacity_gb: 256
       # posix_capacity_gb: 1024
