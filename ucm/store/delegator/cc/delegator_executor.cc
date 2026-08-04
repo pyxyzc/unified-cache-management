@@ -749,7 +749,7 @@ void Executor::LoadLoop(std::promise<Status>& started)
                 if (!group.transferPending) { continue; }
 
                 auto completed = backend_->Check(group.transferTask);
-                if (!completed) { continue; }
+                if (!completed.Value()) { continue; }
 
                 // Check(true) only means that the backend task has completed. The final
                 // success/failure status is retrieved by Wait().
