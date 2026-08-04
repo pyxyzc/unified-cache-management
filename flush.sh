@@ -1,1 +1,1 @@
-curl -X POST http://localhost:8090/reset_prefix_cache
+curl -X POST http://localhost:8010/reset_prefix_cache

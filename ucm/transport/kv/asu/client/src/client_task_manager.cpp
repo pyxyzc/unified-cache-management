@@ -114,13 +114,13 @@ Status ClientTaskManager::Check(TaskId taskId, TaskResult& result)
     if (!task) { return Status::Error(StatusCode::TASK_NOT_FOUND, "task not found"); }
 
     Status status;
-    bool done = false;
+    // bool done = false;
     {
         std::lock_guard<std::mutex> lock(task->waitMu);
         status = BuildResult(task, result);
-        done = task->Done();
+        // done = task->Done();
     }
-    if (done) { (void)Remove(taskId); }
+    // if (done) { (void)Remove(taskId); }
     return status;
 }
 

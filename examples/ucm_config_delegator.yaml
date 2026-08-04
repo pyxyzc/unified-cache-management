@@ -6,13 +6,13 @@
 ucm_connectors:
   - ucm_connector_name: "UcmPipelineStore"
     ucm_connector_config:
-      store_pipeline: "ASU"
+      # store_pipeline: "ASU"
       
-      # store_pipeline: "Delegator"
-      # delegator_backend: "ASU"
-      # # Number of registered device staging slots used by DelegatorStore.
-      # delegator_buffer_number: 4
-      # delegator_stream_number: 4
+      store_pipeline: "Delegator"
+      delegator_backend: "ASU"
+      # Number of registered device staging slots used by DelegatorStore.
+      delegator_buffer_number: 4
+      delegator_stream_number: 4
 
       asu_mode: "client"
       # asu_client_id: "ucm-vllm-asu-aiv"
@@ -39,7 +39,7 @@ ucm_connectors:
 
       # Local software backend. This uses normal AsuClient + AsuTransportImpl submit/CQE paths
       # and replaces the missing device Send/backend execution with local files.
-      asu_fake_backend_path: "/workspace/kvcache"
+      asu_fake_backend_path: "/home/yp/kvcache"
       asu_fake_backend_latency_ms: 1
 
       # ASU wait, operation timeout, and connection recovery.
@@ -49,5 +49,5 @@ ucm_connectors:
       asu_max_inflight_tasks: 1024
 
 enable_event_sync: true
-use_layerwise: false
+use_layerwise: true
 persist_token_threshold: 0

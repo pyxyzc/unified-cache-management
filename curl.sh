@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 服务地址和端口
-URL="http://localhost:8090/v1/chat/completions"
+URL="http://localhost:8010/v1/chat/completions"
 
 # 设置请求头和 JSON 请求体
 curl -X POST "$URL" \
