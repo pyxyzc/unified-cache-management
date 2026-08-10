@@ -728,6 +728,8 @@ void Executor::LoadLoop(std::promise<Status>& started)
         timings.reserve(batch.groups.size());
 
         std::size_t pendingGroupCount = 0;
+        double scatterEnqueueDuration = 0.0;
+        std::size_t scatterShardCount = 0;
         for (auto& group : batch.groups) {
             if (Logger::isEnabledFor(Logger::Level::DEBUG)) {
                 UC_DEBUG("Delegator LOAD task({},{}) processing KVCache shards=[{}].",
@@ -781,7 +783,18 @@ void Executor::LoadLoop(std::promise<Status>& started)
                         group.shards.size(), (NowTime::Now() - timing.backendStartTp) * 1e3);
                     // Record the start time for D2D duration calculation.
                     timing.d2dStartTp = NowTime::Now();
+                    const auto scatterEnqueueStartTp = NowTime::Now();
                     const auto scatterStatus = ScatterAsync(group, streams);
+                    const auto scatterEnqueueEndTp = NowTime::Now();
+                    const auto groupScatterEnqueueDuration =
+                        scatterEnqueueEndTp - scatterEnqueueStartTp;
+                    scatterEnqueueDuration += groupScatterEnqueueDuration;
+                    if (scatterStatus.Success()) { scatterShardCount += group.shards.size(); }
+                    UC_DEBUG(
+                        "Delegator LOAD task({},{}) stage=scatter_enqueued, shards={}, "
+                        "stream_count={}, scatter_enqueue_duration={:.3f}ms.",
+                        group.task->id, group.task->desc.brief, group.shards.size(),
+                        streams.Size(), groupScatterEnqueueDuration * 1e3);
                     if (scatterStatus.Failure()) {
                         group.error = scatterStatus;
                         UC_ERROR("Delegator LOAD task({},{}) stage=scatter failed, status={}.",
@@ -793,9 +806,16 @@ void Executor::LoadLoop(std::promise<Status>& started)
                 --pendingGroupCount;
             }
         }
+        const auto syncStartTp = NowTime::Now();
         const auto syncStatus = streams.SynchronizeAll();
+        const auto syncEndTp = NowTime::Now();
+        UC_DEBUG(
+            "Delegator LOAD batch stage=d2d_timing, groups={}, shards={}, stream_count={}, "
+            "scatter_enqueue_duration={:.3f}ms, sync_all_duration={:.3f}ms.",
+            batch.groups.size(), scatterShardCount, streams.Size(), scatterEnqueueDuration * 1e3,
+            (syncEndTp - syncStartTp) * 1e3);
         // Record the end time for D2D duration calculation.
-        const auto d2dEndTp = NowTime::Now();
+        const auto d2dEndTp = syncEndTp;
         if (syncStatus.Failure()) {
             for (auto& group : batch.groups) {
                 if (!group.error) {
