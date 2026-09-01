@@ -36,6 +36,56 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _fawa_trace(event: str, **fields: object) -> None:
+    """Emit opt-in, structured breadcrumbs for the FAWA/DSV4 path.
+
+    FAWA is exercised from both the scheduler and every worker.  Keeping the
+    trace behind an environment switch makes it useful for bring-up without
+    adding per-request log volume to normal serving runs.
+    """
+
+    if os.getenv("UCM_FAWA_TRACE", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    details = ", ".join(f"{key}={value!r}" for key, value in fields.items())
+    suffix = f": {details}" if details else ""
+    logger.info(f"[FAWA_TRACE] {event}{suffix}")
+
+
+def _preview_bytes(values: Sequence[bytes], limit: int = 3) -> list[str]:
+    """Return short hash previews so traces do not dump complete cache keys."""
+
+    return [value[:8].hex() for value in values[:limit]]
+
+
+def _preview_ints(values: Sequence[int], limit: int = 8) -> list[int]:
+    """Return a bounded preview of physical vLLM block ids."""
+
+    return [int(value) for value in values[:limit]]
+
+
+def _describe_cache_value(value: object) -> object:
+    """Summarize a registered cache tensor without materializing its contents."""
+
+    if isinstance(value, torch.Tensor):
+        return {
+            "shape": tuple(value.shape),
+            "stride": tuple(value.stride()),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+        }
+    if isinstance(value, Tuple):
+        return {
+            "type": "tuple",
+            "items": [_describe_cache_value(item) for item in value],
+        }
+    return {"type": type(value).__name__}
+
+
 @dataclass(frozen=True)
 class KVCacheGroupMeta:
     """Logical storage shape for one vLLM KV-cache group."""
@@ -200,6 +250,17 @@ class KVCacheGroupLayout:
             f"ptrs={len(ptrs)}, "
             f"tensor_block_sizes={sorted(set(tensor_block_sizes))}"
         )
+        _fawa_trace(
+            "layout.built",
+            is_ascend_layout=self.is_ascend_layout,
+            expected_block_size=self.expected_block_size,
+            cache_layer_count=len(self.kvcaches),
+            view_count=len(self.view_meta),
+            base_ptrs_shape=self.base_ptrs.shape,
+            block_strides_shape=self.block_strides.shape,
+            tensor_block_sizes=self.tensor_block_sizes.tolist(),
+            views=self.view_meta[:4],
+        )
 
     def extract_addrs_with_offsets(
         self,
@@ -330,6 +391,25 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ):
         self._defer_scheduler_store = True
         super().__init__(vllm_config, role, kv_cache_config)
+        model_config = getattr(vllm_config, "model_config", None)
+        _fawa_trace(
+            "connector.init.start",
+            role=str(role),
+            model=getattr(model_config, "model", None),
+            model_type=getattr(
+                getattr(model_config, "hf_config", None), "model_type", None
+            ),
+            device_id=self.device_id,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            cache_block_size=self.block_size,
+            is_mla=self.is_mla,
+            unique_id_shared=bool(
+                self.connector_configs[0]
+                .get("ucm_connector_config", {})
+                .get("share_buffer_enable", self.is_mla)
+            ),
+        )
         self.hash_block_size = self.DEFAULT_HASH_BLOCK_SIZE
         self.group_layouts: dict[int, KVCacheGroupLayout] = {}
         if self._kv_cache_config is None:
@@ -378,6 +458,20 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             f"is_ascend_layout={self.is_ascend_layout}, "
             f"group_metas={group_meta_summary}"
         )
+        _fawa_trace(
+            "connector.init.done",
+            role=str(role),
+            hash_block_size=self.hash_block_size,
+            max_token_block_size=self.max_token_block_size,
+            fa_group_ids=self.fa_group_ids,
+            window_group_ids=self.window_group_ids,
+            group_metas=group_meta_summary,
+            file_size=self.file_size,
+            scheduler_stores_created=role == KVConnectorRole.SCHEDULER,
+            persist_token_threshold=self.persist_token_threshold,
+            load_tokens_threshold=self.load_tokens_threshold,
+            wa_dump_block_wise=self.wa_dump_block_wise,
+        )
         logger.info("Init UCM FAWA connector.")
 
     def get_block_size(self) -> int:
@@ -406,8 +500,25 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         DS_V4_REQUIRED_SPECS = frozenset({"SlidingWindowMLASpec"})
         gpu_support = DS_V4_REQUIRED_SPECS.issubset(spec_names)
         if gpu_support:
+            _fawa_trace(
+                "can_handle_kv_cache_config",
+                path="gpu",
+                group_count=len(kv_cache_groups),
+                spec_names=sorted(spec_names),
+                required_specs=sorted(DS_V4_REQUIRED_SPECS),
+                selected=True,
+            )
             return True
-        return cls.can_handle_ascend_kv_cache_config(kv_cache_config)
+        ascend_support = cls.can_handle_ascend_kv_cache_config(kv_cache_config)
+        _fawa_trace(
+            "can_handle_kv_cache_config",
+            path="ascend" if ascend_support else "unsupported",
+            group_count=len(kv_cache_groups),
+            spec_names=sorted(spec_names),
+            required_specs=sorted(DS_V4_REQUIRED_SPECS),
+            selected=ascend_support,
+        )
+        return ascend_support
 
     @classmethod
     def can_handle_ascend_kv_cache_config(
@@ -429,6 +540,13 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             spec_names.add(type(spec).__name__)
         ASCEND_REQUIRED_SPECS = frozenset({"AscendSlidingWindowMLASpec"})
         npu_support = ASCEND_REQUIRED_SPECS.issubset(spec_names)
+        _fawa_trace(
+            "can_handle_ascend_kv_cache_config",
+            group_count=len(kv_cache_groups),
+            spec_names=sorted(spec_names),
+            required_specs=sorted(ASCEND_REQUIRED_SPECS),
+            selected=npu_support,
+        )
         return npu_support
 
     @classmethod
@@ -457,6 +575,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 "Expected exactly one Ascend C4 full-attention block size, "
                 f"got {sorted(c4_block_sizes)}."
             )
+        c4_block_size_candidates = sorted(c4_block_sizes)
         block_size = c4_block_sizes.pop()
 
         if block_size not in cls.ASCEND_SUPPORTED_VLLM_BLOCK_SIZES:
@@ -465,6 +584,12 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 f"Unsupported DeepSeek V4 Ascend block size {block_size}; "
                 f"expected one of {supported}."
             )
+        _fawa_trace(
+            "ascend.base_block_size",
+            c4_block_sizes=c4_block_size_candidates,
+            selected_block_size=block_size,
+            hash_block_size=block_size * cls.ASCEND_C4_COMPRESS_RATIO,
+        )
         return block_size
 
     def _init_group_metas(self) -> None:
@@ -488,6 +613,15 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         )
         if layer_compress_ratios is None:
             raise ValueError("current only support DSV4")
+        _fawa_trace(
+            "group_meta.init",
+            group_count=len(groups),
+            is_ascend_layout=self.is_ascend_layout,
+            ascend_base_block_size=self.ascend_base_block_size,
+            hash_block_size=self.hash_block_size,
+            compress_ratio_count=len(layer_compress_ratios),
+            compress_ratio_preview=list(layer_compress_ratios[:8]),
+        )
         for group_id, group in enumerate(groups):
             kv_cache_spec = group.kv_cache_spec
             # Use the representative spec when vLLM wraps multiple layer specs.
@@ -525,6 +659,20 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 token_block_size=token_block_size,
                 tail_blocks=tail_blocks,
                 tail_tokens=tail_tokens,
+            )
+            _fawa_trace(
+                "group_meta.classified",
+                group_id=group_id,
+                layer_count=len(group.layer_names),
+                layer_name=group.layer_names[0] if group.layer_names else None,
+                spec_type=type(spec).__name__,
+                kind="FA" if window_size is None else "WA",
+                window_size=window_size,
+                compress_ratio=compress_ratio,
+                vllm_block_size=kv_cache_spec.block_size,
+                logical_token_block_size=token_block_size,
+                tail_tokens=tail_tokens,
+                tail_blocks=tail_blocks,
             )
         logger.info_once(
             f"max token_block_size of all groups: {self.max_token_block_size}"
@@ -578,6 +726,19 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             ) * num_c4a_layers
         self.file_size["FA"] = round_up(self.file_size["FA"], 4096)
         self.file_size["WA"] = round_up(self.file_size["WA"], 4096)
+        _fawa_trace(
+            "group_meta.file_sizes",
+            model_variant="dsv4_flash" if len(layer_compress_ratios) < 61 else "dsv4_pro",
+            layer_compress_ratio_count=len(layer_compress_ratios),
+            num_total_layers=num_total_layers,
+            speculative_tokens=(
+                getattr(self._vllm_config.speculative_config, "num_speculative_tokens", 0)
+                if self._vllm_config.speculative_config is not None
+                else 0
+            ),
+            file_size=self.file_size,
+            max_token_block_size=self.max_token_block_size,
+        )
 
     def _create_fa_store(
         self,
@@ -729,6 +890,24 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 config["cpu_affinity_cores"] = list(cpu_affinity_cores)
         else:
             config["block_size"] = self.file_size[label]
+        _fawa_trace(
+            "store.create",
+            label=label,
+            role=str(self._role),
+            connector_name=name,
+            store_suffix=store_suffix,
+            device_id=config.get("device_id"),
+            tensor_count=len(tensor_size_list) if tensor_size_list is not None else None,
+            tensor_bytes=(
+                sum(tensor_size_list) if tensor_size_list is not None else None
+            ),
+            shard_size=config.get("shard_size"),
+            block_size=config.get("block_size"),
+            gc_file_size=self.file_size[label],
+            local_rank_size=config.get("local_rank_size"),
+            share_buffer_enable=config.get("share_buffer_enable"),
+            storage_backends=config.get("storage_backends"),
+        )
         logger.info(
             f"create FAWA {label} {name} with config: "
             f"{self._summarize_store_config(config)}"
@@ -755,6 +934,18 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         worker_cores, store_cores = (
             self.device.split_cores(self.device_id) if enable_affinity else (None, None)
         )
+        _fawa_trace(
+            "register_kv_caches.start",
+            role=str(self._role),
+            device_id=self.device_id,
+            device=str(self.device),
+            cache_entry_count=len(kv_caches),
+            group_count=len(self._kv_cache_config.kv_cache_groups),
+            is_ascend_layout=self.is_ascend_layout,
+            cpu_affinity_enabled=enable_affinity,
+            worker_cores=worker_cores,
+            store_cores=store_cores,
+        )
 
         for group_id, group_spec in enumerate(self._kv_cache_config.kv_cache_groups):
             group_caches: dict[str, torch.Tensor] = {}
@@ -769,10 +960,31 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 expected_block_size=group_spec.kv_cache_spec.block_size,
             )
             self.group_layouts[group_id] = layout
+            first_layer_names = group_spec.layer_names[:3]
+            cache_descriptions = {
+                layer_name: _describe_cache_value(group_caches[layer_name])
+                for layer_name in first_layer_names
+            }
+            _fawa_trace(
+                "register_kv_caches.group",
+                group_id=group_id,
+                layer_count=len(group_spec.layer_names),
+                layer_preview=first_layer_names,
+                cache_preview=cache_descriptions,
+                layout_view_count=len(layout.view_meta),
+                layout_tensor_block_size=layout.tensor_block_sizes.tolist(),
+                layout_view_preview=layout.view_meta[:3],
+            )
 
         self.store = self._create_fa_store(self.group_layouts, store_cores)
         self.fa_store = self.store
         self.wa_store = self._create_wa_store(self.group_layouts, store_cores)
+        _fawa_trace(
+            "register_kv_caches.done",
+            group_layout_ids=sorted(self.group_layouts),
+            fa_store_ready=self.fa_store is not None,
+            wa_store_ready=self.wa_store is not None,
+        )
 
         if worker_cores:
             try:
@@ -813,11 +1025,23 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 else "WA" if group_ids == self.window_group_ids else str(group_ids)
             )
             raise RuntimeError(f"Worker FAWA {group_label} layout is empty.")
+        _fawa_trace(
+            "store.tensor_sizes",
+            group_ids=group_ids,
+            tensor_count=len(tensor_size_list),
+            total_bytes=sum(tensor_size_list),
+            first_sizes=tensor_size_list[:8],
+        )
         return tensor_size_list
 
     def _lookup_external_hit_blocks(self, external_keys: list[bytes]) -> int:
         """Find the longest reusable prefix present in both FA and WA stores."""
 
+        _fawa_trace(
+            "external_lookup.start",
+            external_key_count=len(external_keys),
+            key_preview=_preview_bytes(external_keys),
+        )
         if self.fa_store is None:
             raise RuntimeError("FA store is not initialized.")
         if self.wa_store is None:
@@ -825,7 +1049,13 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         fa_hit_blocks = (
             self._rank_consistency.lookup_on_prefix(self.fa_store, external_keys) + 1
         )
+        _fawa_trace(
+            "external_lookup.fa",
+            fa_hit_blocks=fa_hit_blocks,
+            searched_key_count=len(external_keys),
+        )
         if fa_hit_blocks <= 0:
+            _fawa_trace("external_lookup.done", hit_blocks=0, reason="FA miss")
             return 0
 
         # WA rows represent window boundary state, so they are not required to
@@ -833,9 +1063,18 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         # the latest boundary that exists.
         wa_keys = external_keys[:fa_hit_blocks]
         reverse_idx = self._rank_consistency.lookup_on_reverse(self.wa_store, wa_keys)
+        _fawa_trace(
+            "external_lookup.wa",
+            wa_candidate_key_count=len(wa_keys),
+            reverse_idx=reverse_idx,
+            key_preview=_preview_bytes(wa_keys),
+        )
         if reverse_idx < 0:
+            _fawa_trace("external_lookup.done", hit_blocks=0, reason="WA miss")
             return 0
-        return reverse_idx + 1
+        hit_blocks = reverse_idx + 1
+        _fawa_trace("external_lookup.done", hit_blocks=hit_blocks)
+        return hit_blocks
 
     def _prefetch_hit_key_hotness(
         self,
@@ -864,6 +1103,12 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         for label, store, keys in updates:
             if not keys:
                 continue
+            _fawa_trace(
+                "hotness.prefetch",
+                label=label,
+                key_count=len(keys),
+                key_preview=_preview_bytes(keys),
+            )
             try:
                 store.prefetch(keys)
             except Exception as e:
@@ -880,29 +1125,78 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ) -> tuple[int, bool]:
         wa_hbm_hit_block_num = num_computed_tokens // self.hash_block_size
         wa_computed_tokens = wa_hbm_hit_block_num * self.hash_block_size
+        _fawa_trace(
+            "match.start",
+            request_id=request.request_id,
+            request_tokens=request.num_tokens,
+            all_token_id_count=len(request.all_token_ids),
+            num_computed_tokens=num_computed_tokens,
+            hash_block_size=self.hash_block_size,
+            hbm_hit_block_num=wa_hbm_hit_block_num,
+            hbm_computed_tokens=wa_computed_tokens,
+            persist_token_threshold=self.persist_token_threshold,
+            load_tokens_threshold=self.load_tokens_threshold,
+        )
 
         if request.num_tokens <= self.persist_token_threshold:
+            _fawa_trace(
+                "match.decision",
+                request_id=request.request_id,
+                external_hit_tokens=0,
+                need_load=False,
+                reason="below persist_token_threshold",
+            )
             return 0, False
         skip_external_load = request.num_tokens <= (
             wa_computed_tokens + self.load_tokens_threshold
         )
         if skip_external_load and wa_hbm_hit_block_num <= 0:
+            _fawa_trace(
+                "match.decision",
+                request_id=request.request_id,
+                external_hit_tokens=0,
+                need_load=False,
+                reason="load threshold reached with no HBM prefix",
+            )
             return 0, False
 
         canonical_hashes = self.generate_hash(
             self.hash_block_size, request.all_token_ids, self._seed
         )
         fa_hbm_hit_keys = canonical_hashes[:wa_hbm_hit_block_num]
+        _fawa_trace(
+            "match.hashes",
+            request_id=request.request_id,
+            canonical_hash_count=len(canonical_hashes),
+            canonical_hash_preview=_preview_bytes(canonical_hashes),
+            fa_hbm_hit_key_count=len(fa_hbm_hit_keys),
+            fa_hbm_hit_key_preview=_preview_bytes(fa_hbm_hit_keys),
+            skip_external_load=skip_external_load,
+        )
 
         # Even when no external load is worthwhile, the local-HBM prefix is a
         # cache hit and should remain hot in both FAWA backing stores.
         if skip_external_load:
             self._prefetch_hit_key_hotness(fa_hbm_hit_keys, fa_hbm_hit_keys)
+            _fawa_trace(
+                "match.decision",
+                request_id=request.request_id,
+                external_hit_tokens=0,
+                need_load=False,
+                reason="external load skipped by threshold",
+            )
             return 0, False
 
         external_keys = canonical_hashes[wa_hbm_hit_block_num:]
         if not external_keys:
             self._prefetch_hit_key_hotness(fa_hbm_hit_keys, fa_hbm_hit_keys)
+            _fawa_trace(
+                "match.decision",
+                request_id=request.request_id,
+                external_hit_tokens=0,
+                need_load=False,
+                reason="no external keys",
+            )
             return 0, False
 
         external_hit_blocks = 0
@@ -929,7 +1223,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         if num_total_hit_tokens == request.num_tokens:
             external_hit_tokens -= 1
 
+        threshold_forced_compute = False
         if external_hit_blocks * self.hash_block_size <= self.load_tokens_threshold:
+            threshold_forced_compute = True
             external_hit_tokens = 0
             num_total_hit_tokens = num_computed_tokens
             # let wa_hbm_hit_block_num equal to total_hit_block_num,so no need to load external blocks
@@ -942,6 +1238,19 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             total_hit_block_num=total_hit_block_num,
             num_token_ids=request.num_tokens,
             token_processed=num_total_hit_tokens,
+        )
+        _fawa_trace(
+            "match.result",
+            request_id=request.request_id,
+            hbm_hit_block_num=wa_hbm_hit_block_num,
+            external_hit_blocks=external_hit_blocks,
+            total_hit_block_num=total_hit_block_num,
+            num_computed_tokens=num_computed_tokens,
+            num_total_hit_tokens=num_total_hit_tokens,
+            external_hit_tokens=external_hit_tokens,
+            threshold_forced_compute=threshold_forced_compute,
+            request_meta_token_processed=num_total_hit_tokens,
+            request_meta_stored=True,
         )
         logger.info_once(
             f"FAWA request_id: {request.request_id}, "
@@ -1020,6 +1329,16 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         rows before slicing FA/WA rows for this step.
         """
 
+        _fawa_trace(
+            "dispatch.start",
+            hbm_hit_block_num=req_meta.hbm_hit_block_num,
+            total_hit_block_num=req_meta.total_hit_block_num,
+            token_processed=req_meta.token_processed,
+            request_token_count=req_meta.num_token_ids,
+            new_tokens=new_tokens,
+            need_load=need_load,
+            new_vllm_block_counts=[len(block_ids) for block_ids in new_vllm_block_ids],
+        )
         if not req_meta.vllm_block_ids:
             req_meta.vllm_block_ids = tuple([] for _ in self.group_metas)
         if len(new_vllm_block_ids) != len(req_meta.vllm_block_ids):
@@ -1031,6 +1350,15 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             req_meta.vllm_block_ids[group_id].extend(block_ids)
 
         all_group_block_ids = req_meta.vllm_block_ids
+        _fawa_trace(
+            "dispatch.block_state",
+            accumulated_vllm_block_counts=[
+                len(block_ids) for block_ids in all_group_block_ids
+            ],
+            accumulated_vllm_block_preview=[
+                _preview_ints(block_ids) for block_ids in all_group_block_ids
+            ],
+        )
         load_block_keys: list[bytes] = []
         load_start, load_end = 0, 0
         load_vllm_block_ids: list[list[int]] = []
@@ -1050,6 +1378,16 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                         fetch_wa_block_wise=False,  # always fetch the full WA tail on load to simplify logic
                     )
                 )
+            _fawa_trace(
+                "dispatch.load_plan",
+                hash_range=(load_start, load_end),
+                key_count=len(load_block_keys),
+                key_preview=_preview_bytes(load_block_keys),
+                group_block_counts=[len(block_ids) for block_ids in load_vllm_block_ids],
+                group_block_preview=[
+                    _preview_ints(block_ids) for block_ids in load_vllm_block_ids
+                ],
+            )
 
         computed_end_token = min(
             req_meta.num_token_ids,
@@ -1078,7 +1416,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 )
         req_meta.token_processed = computed_end_token
 
-        return FAWARequestDispatchMeta(
+        dispatch_meta = FAWARequestDispatchMeta(
             load_keys=load_block_keys,
             load_hash_start=load_start,
             load_hash_end=load_end,
@@ -1088,11 +1426,35 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             dump_hash_end=dump_end,
             dump_vllm_block_ids=tuple(dump_vllm_block_ids),
         )
+        _fawa_trace(
+            "dispatch.dump_plan",
+            computed_end_token=computed_end_token,
+            dump_hash_range=(dump_start, dump_end),
+            key_count=len(dump_block_keys),
+            key_preview=_preview_bytes(dump_block_keys),
+            group_block_counts=[len(block_ids) for block_ids in dump_vllm_block_ids],
+            group_block_preview=[
+                _preview_ints(block_ids) for block_ids in dump_vllm_block_ids
+            ],
+            next_token_processed=req_meta.token_processed,
+        )
+        return dispatch_meta
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> UCMFAWAConnectorMetadata:
         requests_dispatch_meta: dict[str, FAWARequestDispatchMeta] = {}
+        scheduled_cached_reqs = scheduler_output.scheduled_cached_reqs
+        _fawa_trace(
+            "connector_meta.start",
+            new_request_ids=[
+                request.req_id for request in scheduler_output.scheduled_new_reqs
+            ],
+            cached_request_ids=list(scheduled_cached_reqs.req_ids),
+            finished_request_ids=list(scheduler_output.finished_req_ids),
+            preempted_request_ids=list(scheduler_output.preempted_req_ids or ()),
+            scheduled_token_counts=dict(scheduler_output.num_scheduled_tokens),
+        )
         # New requests may need both external-prefix load and new-block dump.
         for request in scheduler_output.scheduled_new_reqs:
             request_id, vllm_block_ids = request.req_id, request.block_ids
@@ -1104,7 +1466,6 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     tuple(vllm_block_ids),
                 )
 
-        scheduled_cached_reqs = scheduler_output.scheduled_cached_reqs
         for i, request_id in enumerate(scheduled_cached_reqs.req_ids):
             req_meta = self.requests_meta.get(request_id)
             if req_meta:
@@ -1134,7 +1495,23 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             self.requests_meta.pop(request_id, None)
 
         preempted_req_ids = set(scheduler_output.preempted_req_ids or ())
-        return UCMFAWAConnectorMetadata(requests_dispatch_meta, preempted_req_ids)
+        metadata = UCMFAWAConnectorMetadata(requests_dispatch_meta, preempted_req_ids)
+        _fawa_trace(
+            "connector_meta.done",
+            request_count=len(metadata.request_meta),
+            request_ids=list(metadata.request_meta),
+            preempted_request_ids=sorted(metadata.preempted_req_ids),
+            plans={
+                request_id: {
+                    "load_keys": len(request.load_keys),
+                    "load_hash_range": (request.load_hash_start, request.load_hash_end),
+                    "dump_keys": len(request.dump_keys),
+                    "dump_hash_range": (request.dump_hash_start, request.dump_hash_end),
+                }
+                for request_id, request in metadata.request_meta.items()
+            },
+        )
+        return metadata
 
     def _submit_load_task(
         self,
@@ -1146,6 +1523,15 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ) -> FAWALoadTask:
         """Submit one store load and retain block ids for failure reporting."""
 
+        _fawa_trace(
+            "load.submit.start",
+            request_id=request_id,
+            label=label,
+            key_count=len(keys),
+            key_preview=_preview_bytes(keys),
+            ptr_shape=ptrs.shape,
+            ptr_dtype=str(ptrs.dtype),
+        )
         shard_indices = [0] * len(keys)
         task = self._rank_consistency.submit_load(
             store,
@@ -1154,13 +1540,21 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             shard_indices,
             ptrs,
         )
-        return FAWALoadTask(
+        load_task = FAWALoadTask(
             request_id=request_id,
             label=label,
             store=store,
             task=task,
             key_count=len(keys),
         )
+        _fawa_trace(
+            "load.submit.done",
+            request_id=request_id,
+            label=label,
+            key_count=load_task.key_count,
+            task_type=type(task).__name__,
+        )
+        return load_task
 
     def _handle_load_err(self, request_id: str):
         affected_block_ids = self._get_request_all_block_ids(request_id)
@@ -1176,6 +1570,12 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ) -> bool:
         """Wait a load task and mark its anchor blocks invalid on failure."""
 
+        _fawa_trace(
+            "load.wait.start",
+            request_id=load_task.request_id,
+            label=load_task.label,
+            key_count=load_task.key_count,
+        )
         try:
             self._rank_consistency.wait_load(load_task.task)
         except Exception as e:
@@ -1185,6 +1585,13 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             )
             self._handle_load_err(load_task.request_id)
             return False
+        _fawa_trace(
+            "load.wait.done",
+            request_id=load_task.request_id,
+            label=load_task.label,
+            key_count=load_task.key_count,
+            success=True,
+        )
         return True
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -1203,6 +1610,16 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ) -> FAWADumpTask:
         """Submit one store dump for FA or WA rows."""
 
+        _fawa_trace(
+            "dump.submit.start",
+            label=label,
+            key_count=len(keys),
+            key_preview=_preview_bytes(keys),
+            ptr_shape=ptrs.shape,
+            ptr_dtype=str(ptrs.dtype),
+            event_handle=event_handle,
+            request_ids=sorted(block_ids_by_request),
+        )
         shard_indices = [0] * len(keys)
         task = self._rank_consistency.submit_dump(
             store,
@@ -1212,17 +1629,32 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             ptrs,
             event_handle,
         )
-        return FAWADumpTask(
+        dump_task = FAWADumpTask(
             label=label,
             store=store,
             task=task,
             key_count=len(keys),
             event_handle=event_handle,
         )
+        _fawa_trace(
+            "dump.submit.done",
+            label=label,
+            key_count=dump_task.key_count,
+            task_type=type(task).__name__,
+            event_handle=event_handle,
+        )
+        return dump_task
 
     def _extract_fa_ptr(self, store_keys, hash_start, hash_end, candidate_vllm_ids):
         """Build store pointer rows for full-attention cache segments."""
 
+        _fawa_trace(
+            "ptr.fa.start",
+            key_count=len(store_keys),
+            hash_range=(hash_start, hash_end),
+            key_preview=_preview_bytes(store_keys),
+            group_ids=self.fa_group_ids,
+        )
         all_ptrs = []
         for group_id in self.fa_group_ids:
             layout = self.group_layouts.get(group_id)
@@ -1235,19 +1667,44 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             # block, so the row starts at a token offset inside the block.
             if self.hash_block_size == meta.token_block_size:
                 group_ptrs = layout.extract_addrs(block_ids)
+                address_mode = "whole_group_block"
             else:
                 token_start = np.arange(hash_start, hash_end) * self.hash_block_size
                 token_offsets = token_start % meta.token_block_size
                 group_ptrs = layout.extract_addrs_with_offsets(
                     block_ids, meta.token_block_size, token_offsets
                 )
+                address_mode = "token_offset_inside_group_block"
+            _fawa_trace(
+                "ptr.fa.group",
+                group_id=group_id,
+                block_count=len(block_ids),
+                block_preview=_preview_ints(block_ids),
+                group_token_block_size=meta.token_block_size,
+                hash_block_size=self.hash_block_size,
+                address_mode=address_mode,
+                ptr_shape=group_ptrs.shape,
+            )
             all_ptrs.append(group_ptrs)
 
-        return np.concatenate(all_ptrs, axis=1)
+        ptrs = np.concatenate(all_ptrs, axis=1)
+        _fawa_trace(
+            "ptr.fa.done",
+            key_count=len(store_keys),
+            ptr_shape=ptrs.shape,
+            ptr_dtype=str(ptrs.dtype),
+        )
+        return ptrs
 
     def _extract_wa_ptr(self, store_keys, vllm_ids):
         """Build store pointer rows for window-attention tail segments."""
 
+        _fawa_trace(
+            "ptr.wa.start",
+            key_count=len(store_keys),
+            key_preview=_preview_bytes(store_keys),
+            group_ids=self.window_group_ids,
+        )
         all_ptrs = []
         for group_id in self.window_group_ids:
             layout = self.group_layouts.get(group_id)
@@ -1267,16 +1724,36 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 group_ptrs = layout.extract_addrs_with_offsets(
                     block_ids, meta.token_block_size, token_offsets
                 )
+                address_mode = "short_tail_offset_inside_group_block"
             else:
                 token_offsets = np.zeros_like(block_ids)
                 group_ptrs = layout.extract_addrs(block_ids)
                 # Multi-block WA tails are flattened into one store row per
                 # canonical boundary key.
                 group_ptrs = group_ptrs.reshape(len(store_keys), -1)
+                address_mode = "tail_group_blocks"
 
+            _fawa_trace(
+                "ptr.wa.group",
+                group_id=group_id,
+                block_count=len(block_ids),
+                block_preview=_preview_ints(block_ids),
+                group_token_block_size=meta.token_block_size,
+                tail_tokens=meta.tail_tokens,
+                tail_blocks=meta.tail_blocks,
+                address_mode=address_mode,
+                ptr_shape=group_ptrs.shape,
+            )
             all_ptrs.append(group_ptrs)
 
-        return np.concatenate(all_ptrs, axis=1)
+        ptrs = np.concatenate(all_ptrs, axis=1)
+        _fawa_trace(
+            "ptr.wa.done",
+            key_count=len(store_keys),
+            ptr_shape=ptrs.shape,
+            ptr_dtype=str(ptrs.dtype),
+        )
+        return ptrs
 
     def _get_request_all_block_ids(self, request_id: str) -> set[int]:
         """Get all VLLM block ids referenced by one request's load and dump plan."""
@@ -1301,9 +1778,21 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         if not isinstance(metadata, UCMFAWAConnectorMetadata):
             raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
 
+        _fawa_trace(
+            "load.phase.start",
+            role=str(self._role),
+            request_count=len(metadata.request_meta),
+            request_ids=list(metadata.request_meta),
+            forward_context_type=type(forward_context).__name__,
+        )
         tasks: list[FAWALoadTask] = []
         for request_id, request in metadata.request_meta.items():
             if not request.load_keys:
+                _fawa_trace(
+                    "load.request.skip",
+                    request_id=request_id,
+                    reason="no external-hit keys",
+                )
                 continue
 
             try:
@@ -1342,6 +1831,16 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     window_ptrs,
                 )
                 tasks.append(wa_task)
+                _fawa_trace(
+                    "load.request.plan",
+                    request_id=request_id,
+                    load_key_count=len(request.load_keys),
+                    load_hash_range=(request.load_hash_start, request.load_hash_end),
+                    fa_ptr_shape=fa_ptrs.shape,
+                    wa_key_count=len(window_keys),
+                    wa_ptr_shape=window_ptrs.shape,
+                    note="FA loads every external block; WA loads final matched boundary",
+                )
             except Exception as e:
                 logger.error(
                     f"request {request_id} submit FAWA load task "
@@ -1350,6 +1849,12 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 self._handle_load_err(request_id)
 
         self._wait_all_load_task(tasks)
+        _fawa_trace(
+            "load.phase.done",
+            task_count=len(tasks),
+            task_labels=[task.label for task in tasks],
+            task_key_counts=[task.key_count for task in tasks],
+        )
 
     def _wait_all_load_task(self, tasks: list[FAWALoadTask]):
         load_bytes = 0
@@ -1358,6 +1863,12 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 load_bytes += load_task.key_count * self.file_size[load_task.label]
         if tasks:
             ucmmetrics.update_stats({"load_bytes_total": load_bytes})
+        _fawa_trace(
+            "load.wait_all.done",
+            task_count=len(tasks),
+            load_bytes=load_bytes,
+            file_size=self.file_size,
+        )
 
     def wait_for_save(self) -> None:
         metadata = self._get_connector_metadata()
@@ -1369,6 +1880,16 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         if self.wa_store is None:
             raise RuntimeError("WA store is not initialized.")
 
+        _fawa_trace(
+            "save.phase.start",
+            role=str(self._role),
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            wa_dump_block_wise=self.wa_dump_block_wise,
+            request_count=len(metadata.request_meta),
+            request_ids=list(metadata.request_meta),
+            pending_dump_group_count=len(self.tp_dump_tasks),
+        )
         self._poll_completed_dump_tasks()
 
         fa_dump_keys: list[bytes] = []
@@ -1391,6 +1912,15 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 tp_block_start = num_keys * self.tp_rank // self.tp_size
                 tp_block_end = num_keys * (self.tp_rank + 1) // self.tp_size
                 tp_dump_keys = request.dump_keys[tp_block_start:tp_block_end]
+                _fawa_trace(
+                    "save.request.tp_split",
+                    request_id=request_id,
+                    total_dump_key_count=num_keys,
+                    tp_block_range=(tp_block_start, tp_block_end),
+                    tp_dump_key_count=len(tp_dump_keys),
+                    tp_dump_key_preview=_preview_bytes(tp_dump_keys),
+                    wa_dump_block_wise=self.wa_dump_block_wise,
+                )
                 if tp_dump_keys:
                     fa_dump_blocks_by_request[request_id] = set(tp_dump_keys)
                     fa_dump_vllm_block_ids = tuple(
@@ -1455,6 +1985,14 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 if not request.dump_keys:
                     continue
                 dump_request_ids += (request_id,)
+                _fawa_trace(
+                    "save.request.single_rank",
+                    request_id=request_id,
+                    dump_key_count=len(request.dump_keys),
+                    dump_key_preview=_preview_bytes(request.dump_keys),
+                    hash_range=(request.dump_hash_start, request.dump_hash_end),
+                    wa_dump_block_wise=self.wa_dump_block_wise,
+                )
                 fa_dump_blocks_by_request[request_id] = set(request.dump_keys)
                 fa_dump_keys.extend(request.dump_keys)
                 fa_ptr_rows.append(
@@ -1485,6 +2023,18 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                         )
                     )
 
+        _fawa_trace(
+            "save.plan",
+            dump_request_ids=dump_request_ids,
+            fa_key_count=len(fa_dump_keys),
+            wa_key_count=len(wa_dump_keys),
+            fa_key_preview=_preview_bytes(fa_dump_keys),
+            wa_key_preview=_preview_bytes(wa_dump_keys),
+            fa_ptr_row_count=len(fa_ptr_rows),
+            wa_ptr_row_count=len(wa_ptr_rows),
+            fa_ptr_shapes=[ptrs.shape for ptrs in fa_ptr_rows],
+            wa_ptr_shapes=[ptrs.shape for ptrs in wa_ptr_rows],
+        )
         if fa_dump_keys:
             event_handle = self._get_dump_event_handle()
             fa_ptrs = np.vstack(fa_ptr_rows)
@@ -1501,6 +2051,14 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 )
                 self.tp_dump_tasks[dump_request_ids].append(fa_dump_task)
                 save_bytes += fa_dump_task.key_count * self.file_size["FA"]
+                _fawa_trace(
+                    "save.fa.submitted",
+                    dump_request_ids=dump_request_ids,
+                    key_count=fa_dump_task.key_count,
+                    ptr_shape=fa_ptrs.shape,
+                    event_handle=event_handle,
+                    pending_task_count=len(self.tp_dump_tasks[dump_request_ids]),
+                )
             except Exception as e:
                 self.device.destroy_event_handle(event_handle)
                 logger.error(f"dump FAWA kv cache failed. {type(e).__name__}: {e}")
@@ -1533,16 +2091,38 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     self._record_counter("connector_dump_wait_errors_total")
                 finally:
                     self.device.destroy_event_handle(wa_dump_task.event_handle)
+                _fawa_trace(
+                    "save.wa.submitted_and_waited",
+                    key_count=wa_dump_task.key_count,
+                    ptr_shape=window_ptrs.shape,
+                    event_handle=event_handle,
+                )
             except Exception as e:
                 self.device.destroy_event_handle(event_handle)
                 logger.error(f"dump FAWA WA kv cache failed. {type(e).__name__}: {e}")
                 self._record_counter("connector_dump_submit_errors_total")
         if fa_dump_keys or wa_dump_keys:
             ucmmetrics.update_stats({"save_bytes_total": save_bytes})
+        _fawa_trace(
+            "save.phase.done",
+            fa_key_count=len(fa_dump_keys),
+            wa_key_count=len(wa_dump_keys),
+            save_bytes=save_bytes,
+            pending_dump_group_count=len(self.tp_dump_tasks),
+        )
 
     def _poll_completed_dump_tasks(self) -> None:
         """Reap completed FAWA dump tasks without waiting for in-flight tasks."""
 
+        _fawa_trace(
+            "dump.poll.start",
+            pending_group_count=len(self.tp_dump_tasks),
+            pending_task_count=sum(
+                len(dump_tasks) for dump_tasks in self.tp_dump_tasks.values()
+            ),
+        )
+        completed_task_count = 0
+        still_in_flight_count = 0
         for request_ids, dump_tasks in list(self.tp_dump_tasks.items()):
             in_flight_tasks = []
             for dump_task in dump_tasks:
@@ -1560,6 +2140,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     continue
 
                 if task_finished:
+                    completed_task_count += 1
                     try:
                         self._rank_consistency.wait_dump(dump_task.task)
                     except Exception as e:
@@ -1571,12 +2152,19 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     finally:
                         self.device.destroy_event_handle(dump_task.event_handle)
                 else:
+                    still_in_flight_count += 1
                     in_flight_tasks.append(dump_task)
 
             if in_flight_tasks:
                 self.tp_dump_tasks[request_ids] = in_flight_tasks
             else:
                 self.tp_dump_tasks.pop(request_ids, None)
+        _fawa_trace(
+            "dump.poll.done",
+            completed_task_count=completed_task_count,
+            still_in_flight_count=still_in_flight_count,
+            pending_group_count=len(self.tp_dump_tasks),
+        )
 
     def _drain_best_effort_dump_tasks(self, finished_req_ids: set[str]) -> None:
         """Best-effort wait for FAWA dump tasks.
@@ -1588,6 +2176,11 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         if not finished_req_ids:
             return
 
+        _fawa_trace(
+            "dump.drain.start",
+            finished_request_ids=sorted(finished_req_ids),
+            pending_group_count=len(self.tp_dump_tasks),
+        )
         finished_chunk_req_ids = []
         for request_ids, dump_tasks in self.tp_dump_tasks.items():
             if finished_req_ids.intersection(request_ids):
@@ -1607,9 +2200,18 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
         for request_ids in finished_chunk_req_ids:
             self.tp_dump_tasks.pop(request_ids, None)
+        _fawa_trace(
+            "dump.drain.done",
+            drained_group_count=len(finished_chunk_req_ids),
+            pending_group_count=len(self.tp_dump_tasks),
+        )
 
     def handle_preemptions(self, kv_connector_metadata: UCMFAWAConnectorMetadata):
         # Worker side method
+        _fawa_trace(
+            "request.preemptions",
+            preempted_request_ids=sorted(kv_connector_metadata.preempted_req_ids),
+        )
         self._drain_best_effort_dump_tasks(kv_connector_metadata.preempted_req_ids)
 
     def get_finished(
@@ -1617,6 +2219,10 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         finished_req_ids: set[str],
     ) -> tuple[set[str] | None, set[str] | None]:
         # Worker side method
+        _fawa_trace(
+            "request.finished",
+            finished_request_ids=sorted(finished_req_ids),
+        )
         self._drain_best_effort_dump_tasks(finished_req_ids)
         self._rank_consistency.finish_dump(finished_req_ids)
         return finished_req_ids, None
