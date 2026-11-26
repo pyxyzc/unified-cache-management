@@ -3813,7 +3813,7 @@ new file mode 100644
 index 0000000000..5aae0cc175
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/od_kv_storage/worker.py
-@@ -0,0 +1,1069 @@
+@@ -0,0 +1,1072 @@
 +import asyncio
 +import collections
 +import math
@@ -4768,6 +4768,9 @@ index 0000000000..5aae0cc175
 +            attn_metadata (AttentionMetadata): the attention metadata.
 +            **kwargs: additional arguments for the save operation.
 +        """
++        if self._kv_role == "kv_consumer":
++            return
++
 +        layer_idx = extract_layer_index(layer_name)
 +
 +        # no store
